@@ -152,9 +152,6 @@ systemd and local runs can be rootless):
 
 - **Healthchecks** — Podman 4.3 schedules them with systemd timers; without
   systemd they never leave `starting` (`TestLocalComposeUp`).
-- **Ping-based tests in rootless mode** — rootless containers lack
-  `CAP_NET_RAW` here (`TestWatchExec`, `TestUpStopWithLogsMixed`); they pass
-  with rootful Podman in CI.
 - **Fixed subnets** — tests hard-coding `192.168.0.0/16` collide with the host
   network of the test machine (`TestNetworkConfigChanged`).
 - **SELinux relabel mode** — `TestLocalComposeVolume` asserts the inspect
@@ -162,16 +159,17 @@ systemd and local runs can be rootless):
 - **Logs-follow cold start** — `TestLocalComposeLogsFollow` gives the first
   stream 1s to produce a line; Podman can take longer on a loaded host. The
   follow itself, including replicas created later, works.
-- **Rootless host file permissions** — `TestLocalComposeLargeLogs` bind-mounts
-  a 0600 temp file the rootless container user cannot read.
+- **Rootless host file permissions** — tests bind-mount 0600 files under the
+  test temp dir, which the rootless container user cannot read
+  (`TestComposeRun`, `TestLocalComposeLargeLogs`, `TestStdoutStderr`).
 
 ### Full-suite baseline (Podman 5.8.9 rootless, 2026-11-01)
 
-`go test -tags e2e ./pkg/e2e` → **183 pass / 47 fail / 9 skip** at the time
-of this snapshot. The compose-side fixes now also make
-`TestScaleDownNoRecreate`, `TestWatchSyncIntoSymlinkedDirectory`,
-`TestCascadeIgnoresOneOffContainer` and `TestExposeRange` pass. Every remaining
-failure falls into the categories above:
+Whole suite, serial, with `TMPDIR` under `/tmp/opencode`:
+
+`go test -tags e2e ./pkg/e2e -parallel 1` → **186 pass / 42 fail / 11 skip**.
+The skips are optional Docker Desktop, model/buildx and multi-platform cases.
+Every remaining failure falls into the categories above:
 
 - BuildKit/buildx/build-log: `TestBuild*`, `TestComposeRunBuild`,
   `TestRunBuildOnce{Dependency,NestedDependencies,NoDeps}`.
@@ -181,13 +179,11 @@ failure falls into the categories above:
 - Engine behavior: `TestIPAMConfig`, `TestLocalComposeLogsFollow`,
   `TestNetworkLinks`, `TestNoDepsNetworkMode`,
   `TestUpAttachedTerminatesOnExternalStop`,
-  `TestRebuildOnDotEnvWithExternalNetwork`, `TestAttachRestart`,
-  `TestLoggingDriver`.
-- Environment/flaky on this host: `TestLocalComposeUp` (no systemd),
-  `TestUpStopWithLogsMixed`/`TestWatchExec` (rootless ping),
-  `TestWatchMultiServices` (watch timing), `TestNetworkConfigChanged`
-  (host subnet), `TestLocalComposeVolume` (SELinux mode field),
-  `TestLocalComposeLargeLogs` (rootless file permissions).
+  `TestRebuildOnDotEnvWithExternalNetwork`, `TestLoggingDriver`.
+- Environment on this host: `TestLocalComposeUp` (no systemd),
+  `TestNetworkConfigChanged` (host subnet), `TestLocalComposeVolume`
+  (SELinux mode field), `TestComposeRun`/`TestLocalComposeLargeLogs`/
+  `TestStdoutStderr` (rootless file permissions).
 
 The CI script runs the passing Podman-relevant subset; expanding it to the
 whole suite requires either fixing the engine gaps above or marking these as
