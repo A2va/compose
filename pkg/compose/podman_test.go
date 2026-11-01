@@ -19,10 +19,13 @@ package compose
 import (
 	"archive/tar"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
+	"github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/moby/moby/api/types/mount"
 	"gotest.tools/v3/assert"
@@ -41,7 +44,208 @@ func resetPodmanState(t *testing.T) {
 func createPodmanSocket(t *testing.T, path string) {
 	t.Helper()
 	assert.NilError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-	assert.NilError(t, os.WriteFile(path, nil, 0o600))
+	listener, err := net.Listen("unix", path)
+	assert.NilError(t, err)
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+}
+
+func resetPodmanConfigFiles(t *testing.T) {
+	t.Helper()
+	names := slices.Clone(cli.DefaultFileNames)
+	overrides := slices.Clone(cli.DefaultOverrideFileNames)
+	cli.DefaultFileNames = []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"}
+	cli.DefaultOverrideFileNames = []string{"compose.override.yml", "compose.override.yaml", "docker-compose.override.yml", "docker-compose.override.yaml"}
+	t.Cleanup(func() {
+		cli.DefaultFileNames = names
+		cli.DefaultOverrideFileNames = overrides
+	})
+}
+
+func setPodmanInstalled(t *testing.T, installed bool) {
+	t.Helper()
+	previous := podmanLookPath
+	if installed {
+		podmanLookPath = func(string) (string, error) { return "/usr/bin/podman", nil }
+	} else {
+		podmanLookPath = func(string) (string, error) { return "", os.ErrNotExist }
+	}
+	t.Cleanup(func() {
+		podmanLookPath = previous
+	})
+}
+
+func TestAddPodmanConfigFiles(t *testing.T) {
+	resetPodmanConfigFiles(t)
+	base := slices.Clone(cli.DefaultFileNames)
+	baseOverrides := slices.Clone(cli.DefaultOverrideFileNames)
+
+	addPodmanConfigFiles()
+	assert.DeepEqual(t, cli.DefaultFileNames, slices.Concat(base, podmanConfigFiles))
+	assert.DeepEqual(t, cli.DefaultOverrideFileNames, slices.Concat(baseOverrides, podmanOverrideConfigFiles))
+
+	addPodmanConfigFiles()
+	assert.Equal(t, len(cli.DefaultFileNames), len(base)+len(podmanConfigFiles))
+	assert.Equal(t, len(cli.DefaultOverrideFileNames), len(baseOverrides)+len(podmanOverrideConfigFiles))
+}
+
+func TestPodmanConfigFileDiscovery(t *testing.T) {
+	// Podman mode accepts the standard Docker names too; only extra names were
+	// appended, not substituted.
+	for _, name := range []string{
+		"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml",
+		"podman-compose.yml", "podman-compose.yaml",
+	} {
+		t.Run(name, func(t *testing.T) {
+			resetPodmanState(t)
+			resetPodmanConfigFiles(t)
+			dir := t.TempDir()
+			createPodmanSocket(t, filepath.Join(dir, "podman", "podman.sock"))
+			t.Setenv(containerEngineEnv, "podman")
+			t.Setenv("XDG_RUNTIME_DIR", dir)
+			t.Setenv("DOCKER_HOST", "")
+			t.Setenv("DOCKER_CONTEXT", "")
+			assert.NilError(t, configurePodmanHost("docker-compose", nil))
+
+			projectDir := t.TempDir()
+			composeFile := filepath.Join(projectDir, name)
+			assert.NilError(t, os.WriteFile(composeFile, []byte("services: {}\n"), 0o600))
+
+			options, err := cli.NewProjectOptions(nil, cli.WithWorkingDirectory(projectDir), cli.WithDefaultConfigPath)
+			assert.NilError(t, err)
+			assert.DeepEqual(t, options.ConfigPaths, []string{composeFile})
+		})
+	}
+}
+
+func TestPodmanComposeWrapperAddsConfigFiles(t *testing.T) {
+	resetPodmanState(t)
+	resetPodmanConfigFiles(t)
+	t.Setenv(containerEngineEnv, "")
+	t.Setenv("DOCKER_HOST", "unix:///run/user/1000/podman/podman.sock")
+
+	assert.NilError(t, configurePodmanHost("docker-compose", nil))
+	assert.Assert(t, isPodman())
+	assert.Assert(t, slices.Contains(cli.DefaultFileNames, "podman-compose.yml"))
+}
+
+func TestDockerComposeDefaultsToPodman(t *testing.T) {
+	resetPodmanState(t)
+	resetPodmanConfigFiles(t)
+	setPodmanInstalled(t, true)
+	dir := t.TempDir()
+	socket := filepath.Join(dir, "podman", "podman.sock")
+	createPodmanSocket(t, socket)
+	t.Setenv(containerEngineEnv, "")
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	assert.NilError(t, configurePodmanHost("docker-compose", nil))
+	assert.Equal(t, os.Getenv("DOCKER_HOST"), "unix://"+socket)
+	assert.Assert(t, isPodman())
+	assert.Assert(t, slices.Contains(cli.DefaultFileNames, "podman-compose.yml"))
+}
+
+func TestDockerComposeRespectsDockerHost(t *testing.T) {
+	resetPodmanState(t)
+	resetPodmanConfigFiles(t)
+	setPodmanInstalled(t, true)
+	dir := t.TempDir()
+	createPodmanSocket(t, filepath.Join(dir, "podman", "podman.sock"))
+	t.Setenv(containerEngineEnv, "")
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	assert.NilError(t, configurePodmanHost("docker-compose", nil))
+	assert.Equal(t, os.Getenv("DOCKER_HOST"), "unix:///var/run/docker.sock")
+	assert.Assert(t, !isPodman())
+	assert.DeepEqual(t, cli.DefaultFileNames, []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"})
+}
+
+func TestDockerComposeRequiresSocketWhenPodmanInstalled(t *testing.T) {
+	resetPodmanState(t)
+	setPodmanInstalled(t, true)
+	rootfulPodmanSocket = filepath.Join(t.TempDir(), "missing.sock")
+	t.Setenv(containerEngineEnv, "")
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	err := configurePodmanHost("docker-compose", nil)
+	assert.ErrorContains(t, err, "no Podman socket found")
+	assert.Assert(t, !isPodman())
+}
+
+func TestDockerComposeFallsBackToDockerWithoutPodman(t *testing.T) {
+	resetPodmanState(t)
+	resetPodmanConfigFiles(t)
+	setPodmanInstalled(t, false)
+	rootfulPodmanSocket = filepath.Join(t.TempDir(), "missing.sock")
+	t.Setenv(containerEngineEnv, "")
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	assert.NilError(t, configurePodmanHost("docker-compose", nil))
+	assert.Equal(t, os.Getenv("DOCKER_HOST"), "")
+	assert.Assert(t, !isPodman())
+	assert.DeepEqual(t, cli.DefaultFileNames, []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"})
+}
+
+func TestDockerComposeIgnoresStalePodmanSocketWithoutPodman(t *testing.T) {
+	resetPodmanState(t)
+	setPodmanInstalled(t, false)
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "podman", "podman.sock")
+	assert.NilError(t, os.MkdirAll(filepath.Dir(stale), 0o755))
+	assert.NilError(t, os.WriteFile(stale, nil, 0o600))
+	rootfulPodmanSocket = filepath.Join(dir, "missing.sock")
+	t.Setenv(containerEngineEnv, "")
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	assert.NilError(t, configurePodmanHost("docker-compose", nil))
+	assert.Equal(t, os.Getenv("DOCKER_HOST"), "")
+	assert.Assert(t, !isPodman())
+}
+
+func TestDockerComposeErrorsOnStalePodmanSocketWithPodman(t *testing.T) {
+	resetPodmanState(t)
+	setPodmanInstalled(t, true)
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "podman", "podman.sock")
+	assert.NilError(t, os.MkdirAll(filepath.Dir(stale), 0o755))
+	assert.NilError(t, os.WriteFile(stale, nil, 0o600))
+	rootfulPodmanSocket = filepath.Join(dir, "missing.sock")
+	t.Setenv(containerEngineEnv, "")
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	err := configurePodmanHost("docker-compose", nil)
+	assert.ErrorContains(t, err, "cannot connect to Podman socket")
+	assert.Assert(t, !isPodman())
+}
+
+func TestPodmanSocketCandidates(t *testing.T) {
+	previous := rootfulPodmanSocket
+	rootfulPodmanSocket = "/run/podman/podman.sock"
+	t.Cleanup(func() {
+		rootfulPodmanSocket = previous
+	})
+
+	assert.DeepEqual(t, podmanSocketCandidates("/run/user/1000", false), []string{
+		"/run/user/1000/podman/podman.sock", "/run/podman/podman.sock",
+	})
+	// sudo keeps XDG_RUNTIME_DIR in some setups; root still prefers the rootful socket.
+	assert.DeepEqual(t, podmanSocketCandidates("/run/user/1000", true), []string{
+		"/run/podman/podman.sock", "/run/user/1000/podman/podman.sock",
+	})
+	assert.DeepEqual(t, podmanSocketCandidates("", true), []string{"/run/podman/podman.sock"})
 }
 
 func TestConfigurePodmanHostExplicitPodman(t *testing.T) {
@@ -69,19 +273,52 @@ func TestConfigurePodmanHostExplicitPodmanWithoutSocket(t *testing.T) {
 
 	err := configurePodmanHost("docker-compose", nil)
 	assert.ErrorContains(t, err, "no Podman socket found")
+	assert.ErrorContains(t, err, "rootless")
+	assert.Assert(t, !isPodman())
+}
+
+func TestConfigurePodmanHostSkipsStaleSocket(t *testing.T) {
+	resetPodmanState(t)
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "podman", "podman.sock")
+	assert.NilError(t, os.MkdirAll(filepath.Dir(stale), 0o755))
+	assert.NilError(t, os.WriteFile(stale, nil, 0o600))
+	rootful := filepath.Join(dir, "rootful.sock")
+	createPodmanSocket(t, rootful)
+	rootfulPodmanSocket = rootful
+	t.Setenv(containerEngineEnv, "podman")
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	assert.NilError(t, configurePodmanHost("docker-compose", nil))
+	assert.Equal(t, os.Getenv("DOCKER_HOST"), "unix://"+rootful)
+}
+
+func TestConfigurePodmanHostStaleSocketOnly(t *testing.T) {
+	resetPodmanState(t)
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "podman", "podman.sock")
+	assert.NilError(t, os.MkdirAll(filepath.Dir(stale), 0o755))
+	assert.NilError(t, os.WriteFile(stale, nil, 0o600))
+	rootfulPodmanSocket = filepath.Join(dir, "missing.sock")
+	t.Setenv(containerEngineEnv, "podman")
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	err := configurePodmanHost("docker-compose", nil)
+	assert.ErrorContains(t, err, "cannot connect to Podman socket")
+	assert.ErrorContains(t, err, "rootless")
 	assert.Assert(t, !isPodman())
 }
 
 func TestConfigurePodmanHostByBinaryName(t *testing.T) {
-	for _, tc := range []struct {
-		argv0    string
-		wantHost bool
-	}{
-		{argv0: "podman-compose", wantHost: true},
-		{argv0: "docker-compose", wantHost: false},
-	} {
-		t.Run(tc.argv0, func(t *testing.T) {
+	// This fork defaults to Podman for either binary name when a socket exists.
+	for _, argv0 := range []string{"podman-compose", "docker-compose"} {
+		t.Run(argv0, func(t *testing.T) {
 			resetPodmanState(t)
+			setPodmanInstalled(t, true)
 			dir := t.TempDir()
 			socket := filepath.Join(dir, "podman", "podman.sock")
 			createPodmanSocket(t, socket)
@@ -90,14 +327,23 @@ func TestConfigurePodmanHostByBinaryName(t *testing.T) {
 			t.Setenv("DOCKER_HOST", "")
 			t.Setenv("DOCKER_CONTEXT", "")
 
-			assert.NilError(t, configurePodmanHost(tc.argv0, nil))
-			if tc.wantHost {
-				assert.Equal(t, os.Getenv("DOCKER_HOST"), "unix://"+socket)
-			} else {
-				assert.Equal(t, os.Getenv("DOCKER_HOST"), "")
-			}
+			assert.NilError(t, configurePodmanHost(argv0, nil))
+			assert.Equal(t, os.Getenv("DOCKER_HOST"), "unix://"+socket)
 		})
 	}
+}
+
+func TestPodmanComposeBinaryRequiresSocket(t *testing.T) {
+	resetPodmanState(t)
+	rootfulPodmanSocket = filepath.Join(t.TempDir(), "missing.sock")
+	t.Setenv(containerEngineEnv, "")
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	err := configurePodmanHost("podman-compose", nil)
+	assert.ErrorContains(t, err, "no Podman socket found")
+	assert.Assert(t, !isPodman())
 }
 
 func TestConfigurePodmanHostRespectsExplicitHost(t *testing.T) {
