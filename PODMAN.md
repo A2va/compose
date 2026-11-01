@@ -4,14 +4,14 @@ This fork makes `docker/compose` (the reference Compose implementation) run nati
 against Podman v4+, with a minimal, rebase-friendly overlay. This document is the
 agreed plan of record; the "Overlay index" section doubles as the rebase checklist.
 
-Status (2026-11-01): P0, P1, P2 and P3 implemented — engine detection, socket
-defaulting, classic-build forcing, registry digest fallback, e2e `DOCKER_HOST`
-support, link emulation, secret ownership, the P1 compat shims (port ranges,
-`json-file`, `dockerfile_inline`, secrets/configs), build-arg image identity,
-watch sync into existing paths, one-off/log-attach races, default-bridge link
-injection, log-driver fallback and a CI matrix that runs the e2e suite against
-Podman 4.3 (Debian 12), 4.9 (Ubuntu 24.04) and current Fedora. Known Podman
-gaps are listed below.
+Status (2026-11-01): P0–P4 implemented — engine detection, socket defaulting
+and probing with rootless hints, classic-build forcing, registry digest
+fallback, e2e `DOCKER_HOST` support, link emulation, secret ownership, the P1
+compat shims (port ranges, `json-file`, `dockerfile_inline`, secrets/configs),
+build-arg image identity, watch sync into existing paths, one-off/log-attach
+races, default-bridge link injection, log-driver fallback and a CI matrix that
+runs the e2e suite against Podman 4.3 (Debian 12), 4.9 (Ubuntu 24.04) and
+current Fedora. Known Podman gaps are listed below.
 
 ## Goal
 
@@ -77,20 +77,48 @@ binary, `pkg/compose/build_bake.go:182`).
 
 **Detection** — `pkg/compose/podman.go`:
 - `COMPOSE_CONTAINER_ENGINE=podman|docker` env var (explicit override), else
-- a binary named `podman-compose` (this fork's packaging) defaults to the
-  Podman socket, while `docker-compose`/plugin invocations keep Docker's
-  default and never get hijacked;
+- a binary named `podman-compose` requires Podman; any other name (including
+  `docker-compose`) prefers Podman too. When the `podman` binary is installed,
+  a missing or stale socket is an error with setup hints; on a host with
+  neither Podman nor a reachable Podman socket, Docker's default is kept. An
+  explicit `DOCKER_HOST`, `DOCKER_CONTEXT`, `-H`/`--host` or `--context`
+  always wins;
 - `isPodman()`, used by the shims, additionally treats any `DOCKER_HOST`
   containing `podman` as Podman. `podman compose` exports exactly that, so
   wrapper-driven runs are detected too. Detection stays API-free on purpose:
   an `/info` probe would force every build-path unit test to stub one more
   call.
+- **Installation** — the binary can keep the `docker-compose` name and still
+  default to Podman; `podman compose` prefers `docker-compose` over
+  `podman-compose`, so a per-user `~/.local/bin` install is picked up by the
+  user's rootless `podman compose` when that directory is on `PATH`.
+- **Default file names** — in Podman mode, `podman-compose.yml`,
+  `podman-compose.yaml` and their `.override` variants are appended to
+  compose-go's default discovery names after `compose.*` and
+  `docker-compose.*`. A Podman-only project therefore needs no `-f`, while a
+  directory that has both keeps using `compose.yaml` or `docker-compose.yml`.
+- **Rootful runs** — `sudo podman compose` runs the provider as root and sets
+  `DOCKER_HOST` to `unix:///run/podman/podman.sock` (unless `DOCKER_HOST` was
+  already set and preserved through sudo), so the rootful engine is used.
+  Running `sudo podman-compose` or `sudo docker-compose` directly probes the
+  rootful socket first when euid is 0, even if `XDG_RUNTIME_DIR` survived
+  sudo; otherwise it could attach to the invoking user's rootless socket.
+  The provider must be discoverable by root: a binary under `~/.local/bin` is
+  not on root's `PATH` and is not read from the user's `containers.conf`, so
+  install it system-wide or add its absolute path to root's
+  `compose_providers`. The provider inherits root's environment, `HOME` and
+  credential helpers, so treat a sudo invocation as a root command.
+- socket selection dials each candidate with a short timeout (this also
+  triggers systemd socket activation). When Podman is installed or explicitly
+  requested, a missing, stale or inaccessible socket fails with
+  rootless/rootful enable hints; only the no-Podman auto-detection path falls
+  back to Docker.
 
 **Overlay index — upstream files touched (the rebase checklist):**
 
 | File | Change |
 |---|---|
-| `cmd/main.go` | Call `compose.ConfigurePodmanHost()` before `plugin.Run`. That helper (`pkg/compose/podman.go`) defaults `DOCKER_HOST` to the rootless/rootful Podman socket when the profile is on and no `DOCKER_HOST`/`DOCKER_CONTEXT`/`-H`/`--host`/`--context` is set; explicit `podman` with no socket exits with an actionable message. |
+| `cmd/main.go` | Call `compose.ConfigurePodmanHost()` before `plugin.Run`. That helper (`pkg/compose/podman.go`) defaults `DOCKER_HOST` to the rootless/rootful Podman socket when the profile is on and no `DOCKER_HOST`/`DOCKER_CONTEXT`/`-H`/`--host`/`--context` is set; explicit `podman` with no responding socket exits with rootless/rootful enable hints. |
 | `pkg/compose/build_bake.go` | If Podman, return classic (`POST /build?version=1`, served by buildah). Podman has no `/grpc` or `/session`, so bake cannot work; without buildx upstream already falls back, this makes it deterministic. |
 | `pkg/compose/build_classic.go` | Materialize `build.dockerfile_inline` to a temp file for the classic builder (it otherwise requires a Dockerfile on disk), and fingerprint build args into an image label so buildah's cache cannot hide a changed arg behind an unchanged image ID. |
 | `pkg/compose/create.go` | Podman-only: expand published port ranges by replica index (`podmanHostPort`), map `json-file` to `k8s-file`, mount an anonymous volume at `/run/secrets` for secrets (`podmanSecretVolume`), skip structured secret/config mounts, skip legacy `links` and publish link aliases on the target's endpoints (`podmanLinkAliases`). |
@@ -106,7 +134,9 @@ All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`,
 `.github/*`), which never conflict on rebase.
 
 **Podman-only helpers (new files):**
-- `podman.go` — profile detection, socket selection, `isPodman()`.
+- `podman.go` — profile detection, Podman default file names, socket
+  selection/probing with rootless hints and rootful-first ordering under sudo,
+  `isPodman()`.
 - `internal/registry/remote.go` — minimal registry client (Bearer challenge, OCI/Docker
   manifest `Accept` headers, body hashing) used by digest resolution. No new
   dependencies.
@@ -246,9 +276,10 @@ skips with the reasons recorded here.
 
 ## Testing
 
-- **Unit**: `go test ./pkg/...`; detection is env/host-based so
-  `pkg/compose/podman_test.go` needs no API mocks, and the build path keeps
-  its existing stubs untouched.
+- **Unit**: `go test ./pkg/...`; detection and socket probing are
+  env/host-based, so `pkg/compose/podman_test.go` needs no API mocks (socket
+  tests use a local unix listener), and the build path keeps its existing
+  stubs untouched.
 - **E2E against Podman**: the CI script
   `.github/scripts/podman-e2e.sh` builds a static test binary and runs the
   validated subset (up/ps/copy/exec/logs/start/stop/events/networks/wait/
@@ -283,9 +314,11 @@ skips with the reasons recorded here.
   paths, one-off event filtering, log attach to already-removed containers,
   default-bridge link injection and unsupported log-driver fallback; widen the
   CI subset with the tests this unlocked.
-- **P4** (optional) — Podman niceties: rootless hints in errors, socket
-  auto-activation check, `podman build` shell-out for multi-arch if ever
-  needed.
+- **P4 (implemented)** — probe the resolved socket at startup (which also
+  triggers systemd socket activation) and report rootless/rootful setup hints
+  when it is missing, stale or inaccessible. No `podman build` shell-out:
+  multi-platform builds stay a BuildKit-only feature with a clear
+  classic-builder error, so the shell-out is deferred until it is needed.
 
 ## Overlay commit layout
 
