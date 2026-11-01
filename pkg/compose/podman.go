@@ -18,9 +18,12 @@ package compose
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Podman support: compose talks to Podman through its Docker-compatible API
@@ -35,6 +38,15 @@ var podmanProfile bool
 
 // rootfulPodmanSocket is a variable so tests can isolate from the host.
 var rootfulPodmanSocket = "/run/podman/podman.sock"
+
+// podmanSocketProbeTimeout bounds the startup check. A systemd socket unit
+// accepts the connection immediately and starts the service afterwards, so a
+// short timeout is enough to tell a live socket from a stale file.
+const podmanSocketProbeTimeout = time.Second
+
+const podmanSocketHints = "for rootless Podman enable " +
+	"'systemctl --user enable --now podman.socket', for rootful enable " +
+	"'systemctl enable --now podman.socket', or run 'podman system service --time=0'"
 
 // ConfigurePodmanHost points this process at the Podman socket when asked to.
 // It must run before docker/cli initializes its client, i.e. before plugin.Run.
@@ -63,13 +75,15 @@ func defaultPodmanHost(required bool, args []string) error {
 	if engineHostConfigured(args) {
 		return nil
 	}
-	socket := podmanSocketPath()
+	socket, err := podmanSocketPath()
+	if err != nil {
+		podmanProfile = false
+		return err
+	}
 	if socket == "" {
 		podmanProfile = false
 		if required {
-			return errors.New("no Podman socket found; enable it with " +
-				"'systemctl --user enable --now podman.socket' (rootless) " +
-				"or 'systemctl enable --now podman.socket' (root)")
+			return errors.New("no Podman socket found; " + podmanSocketHints)
 		}
 		return nil
 	}
@@ -89,17 +103,47 @@ func engineHostConfigured(args []string) bool {
 	return false
 }
 
-func podmanSocketPath() string {
+// podmanSocketPath returns the first Podman socket that accepts a connection.
+// The probe also triggers systemd socket activation. A stale socket file is an
+// error rather than a silent fallback to the Docker default.
+func podmanSocketPath() (string, error) {
+	var (
+		failed string
+		cause  error
+	)
 	if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
-		rootless := filepath.Join(runtimeDir, "podman", "podman.sock")
-		if _, err := os.Stat(rootless); err == nil {
-			return rootless
+		socket := filepath.Join(runtimeDir, "podman", "podman.sock")
+		ok, err := probePodmanSocket(socket)
+		if ok {
+			return socket, nil
+		}
+		if err != nil {
+			failed, cause = socket, err
 		}
 	}
-	if _, err := os.Stat(rootfulPodmanSocket); err == nil {
-		return rootfulPodmanSocket
+	ok, err := probePodmanSocket(rootfulPodmanSocket)
+	if ok {
+		return rootfulPodmanSocket, nil
 	}
-	return ""
+	if err != nil && failed == "" {
+		failed, cause = rootfulPodmanSocket, err
+	}
+	if failed != "" {
+		return "", fmt.Errorf("cannot connect to Podman socket %s: %w; %s", failed, cause, podmanSocketHints)
+	}
+	return "", nil
+}
+
+func probePodmanSocket(path string) (bool, error) {
+	conn, err := net.DialTimeout("unix", path, podmanSocketProbeTimeout)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	_ = conn.Close()
+	return true, nil
 }
 
 // isPodman reports whether this invocation targets Podman. `podman compose`

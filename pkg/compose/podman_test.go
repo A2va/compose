@@ -19,6 +19,7 @@ package compose
 import (
 	"archive/tar"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -41,7 +42,11 @@ func resetPodmanState(t *testing.T) {
 func createPodmanSocket(t *testing.T, path string) {
 	t.Helper()
 	assert.NilError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-	assert.NilError(t, os.WriteFile(path, nil, 0o600))
+	listener, err := net.Listen("unix", path)
+	assert.NilError(t, err)
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
 }
 
 func TestConfigurePodmanHostExplicitPodman(t *testing.T) {
@@ -69,6 +74,43 @@ func TestConfigurePodmanHostExplicitPodmanWithoutSocket(t *testing.T) {
 
 	err := configurePodmanHost("docker-compose", nil)
 	assert.ErrorContains(t, err, "no Podman socket found")
+	assert.ErrorContains(t, err, "rootless")
+	assert.Assert(t, !isPodman())
+}
+
+func TestConfigurePodmanHostSkipsStaleSocket(t *testing.T) {
+	resetPodmanState(t)
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "podman", "podman.sock")
+	assert.NilError(t, os.MkdirAll(filepath.Dir(stale), 0o755))
+	assert.NilError(t, os.WriteFile(stale, nil, 0o600))
+	rootful := filepath.Join(dir, "rootful.sock")
+	createPodmanSocket(t, rootful)
+	rootfulPodmanSocket = rootful
+	t.Setenv(containerEngineEnv, "podman")
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	assert.NilError(t, configurePodmanHost("docker-compose", nil))
+	assert.Equal(t, os.Getenv("DOCKER_HOST"), "unix://"+rootful)
+}
+
+func TestConfigurePodmanHostStaleSocketOnly(t *testing.T) {
+	resetPodmanState(t)
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "podman", "podman.sock")
+	assert.NilError(t, os.MkdirAll(filepath.Dir(stale), 0o755))
+	assert.NilError(t, os.WriteFile(stale, nil, 0o600))
+	rootfulPodmanSocket = filepath.Join(dir, "missing.sock")
+	t.Setenv(containerEngineEnv, "podman")
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	err := configurePodmanHost("docker-compose", nil)
+	assert.ErrorContains(t, err, "cannot connect to Podman socket")
+	assert.ErrorContains(t, err, "rootless")
 	assert.Assert(t, !isPodman())
 }
 
