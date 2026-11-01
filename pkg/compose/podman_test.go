@@ -17,10 +17,12 @@
 package compose
 
 import (
+	"archive/tar"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/compose-spec/compose-go/v2/types"
 	"gotest.tools/v3/assert"
 )
 
@@ -124,4 +126,41 @@ func TestIsPodmanFromDaemonHost(t *testing.T) {
 
 	t.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
 	assert.Assert(t, !isPodman())
+}
+
+func TestPodmanHostPort(t *testing.T) {
+	for _, tc := range []struct {
+		published string
+		number    int
+		want      string
+	}{
+		{published: "8080", number: 3, want: "8080"},
+		{published: "6005-6015", number: 1, want: "6005"},
+		{published: "6005-6015", number: 5, want: "6009"},
+	} {
+		got, err := podmanHostPort(tc.published, tc.number)
+		assert.NilError(t, err)
+		assert.Equal(t, got, tc.want)
+	}
+	_, err := podmanHostPort("6005-6015", 12)
+	assert.ErrorContains(t, err, "too small")
+}
+
+func TestCreateTarUsesRelativeTarget(t *testing.T) {
+	b, err := createTar("hello", types.FileReferenceConfig{Target: "/run/secrets/bar"})
+	assert.NilError(t, err)
+	header, err := tar.NewReader(&b).Next()
+	assert.NilError(t, err)
+	assert.Equal(t, header.Name, "run/secrets/bar")
+}
+
+func TestPodmanFileReferenceFile(t *testing.T) {
+	path, err := podmanFileReferenceFile("project", secretMount, "token", "s3cr3t")
+	assert.NilError(t, err)
+	content, err := os.ReadFile(path)
+	assert.NilError(t, err)
+	assert.Equal(t, string(content), "s3cr3t")
+	info, err := os.Stat(path)
+	assert.NilError(t, err)
+	assert.Equal(t, info.Mode().Perm(), os.FileMode(0o644))
 }

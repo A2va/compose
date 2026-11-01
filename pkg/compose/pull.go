@@ -372,7 +372,15 @@ func (s *composeService) pullServiceImage(ctx context.Context, service types.Ser
 //
 // Docker Hub credentials come from the Docker Desktop session first.
 func ImageDigestResolver(ctx context.Context, file *configfile.ConfigFile, apiClient client.APIClient) func(named reference.Named) (digest.Digest, error) {
-	return registry.ImageDigestResolver(ctx, registry.NewDesktopAuthProvider(file), apiClient)
+	auth := registry.NewDesktopAuthProvider(file)
+	if isPodman() {
+		// Podman's compat API does not implement Docker's /distribution
+		// endpoint, so resolve the index digest against the registry.
+		return func(named reference.Named) (digest.Digest, error) {
+			return registryRemoteDigest(ctx, named, auth)
+		}
+	}
+	return registry.ImageDigestResolver(ctx, auth, apiClient)
 }
 
 func (s *composeService) pullRequiredImages(ctx context.Context, project *types.Project, images map[string]api.ImageSummary, quietPull bool) error {
