@@ -18,9 +18,16 @@ package compose
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"time"
+
+	"github.com/compose-spec/compose-go/v2/cli"
 )
 
 // Podman support: compose talks to Podman through its Docker-compatible API
@@ -33,8 +40,28 @@ const containerEngineEnv = "COMPOSE_CONTAINER_ENGINE"
 // before docker/cli initializes its client.
 var podmanProfile bool
 
+// podmanConfigFiles are accepted as default compose file names in Podman mode.
+// They are appended after the standard names, so a project that has both keeps
+// using compose.yaml.
+var (
+	podmanConfigFiles         = []string{"podman-compose.yml", "podman-compose.yaml"}
+	podmanOverrideConfigFiles = []string{"podman-compose.override.yml", "podman-compose.override.yaml"}
+)
+
 // rootfulPodmanSocket is a variable so tests can isolate from the host.
 var rootfulPodmanSocket = "/run/podman/podman.sock"
+
+// podmanLookPath is a variable so tests can control whether Podman is installed.
+var podmanLookPath = exec.LookPath
+
+// podmanSocketProbeTimeout bounds the startup check. A systemd socket unit
+// accepts the connection immediately and starts the service afterwards, so a
+// short timeout is enough to tell a live socket from a stale file.
+const podmanSocketProbeTimeout = time.Second
+
+const podmanSocketHints = "for rootless Podman enable " +
+	"'systemctl --user enable --now podman.socket', for rootful enable " +
+	"'systemctl enable --now podman.socket', or run 'podman system service --time=0'"
 
 // ConfigurePodmanHost points this process at the Podman socket when asked to.
 // It must run before docker/cli initializes its client, i.e. before plugin.Run.
@@ -47,32 +74,72 @@ func configurePodmanHost(argv0 string, args []string) error {
 	case "docker":
 		return nil
 	case "podman":
-		podmanProfile = true
+		enablePodman()
 		return defaultPodmanHost(true, args)
 	}
-	// A podman-compose binary defaults to the Podman socket; docker-compose
-	// keeps its Docker default even when a Podman socket is present.
-	if !strings.Contains(argv0, "podman") {
+	// `podman compose` exports DOCKER_HOST pointing at the Podman socket, so
+	// wrapper-driven runs are detected even when the provider is docker-compose.
+	if isPodman() {
+		enablePodman()
 		return nil
 	}
-	podmanProfile = true
+	// A podman-compose binary requires Podman. Every other name also prefers
+	// Podman: with the podman binary installed a missing socket is an error,
+	// while a host without Podman keeps Docker's default.
+	if strings.Contains(argv0, "podman") {
+		enablePodman()
+		return defaultPodmanHost(true, args)
+	}
+	if engineHostConfigured(args) {
+		return nil
+	}
+	if podmanInstalled() {
+		enablePodman()
+		return defaultPodmanHost(true, args)
+	}
 	return defaultPodmanHost(false, args)
+}
+
+func podmanInstalled() bool {
+	_, err := podmanLookPath("podman")
+	return err == nil
+}
+
+func enablePodman() {
+	podmanProfile = true
+	addPodmanConfigFiles()
+}
+
+func addPodmanConfigFiles() {
+	for _, name := range podmanConfigFiles {
+		if !slices.Contains(cli.DefaultFileNames, name) {
+			cli.DefaultFileNames = append(cli.DefaultFileNames, name)
+		}
+	}
+	for _, name := range podmanOverrideConfigFiles {
+		if !slices.Contains(cli.DefaultOverrideFileNames, name) {
+			cli.DefaultOverrideFileNames = append(cli.DefaultOverrideFileNames, name)
+		}
+	}
 }
 
 func defaultPodmanHost(required bool, args []string) error {
 	if engineHostConfigured(args) {
 		return nil
 	}
-	socket := podmanSocketPath()
+	socket, err := podmanSocketPath(required)
+	if err != nil {
+		podmanProfile = false
+		return err
+	}
 	if socket == "" {
 		podmanProfile = false
 		if required {
-			return errors.New("no Podman socket found; enable it with " +
-				"'systemctl --user enable --now podman.socket' (rootless) " +
-				"or 'systemctl enable --now podman.socket' (root)")
+			return errors.New("no Podman socket found; " + podmanSocketHints)
 		}
 		return nil
 	}
+	enablePodman()
 	return os.Setenv("DOCKER_HOST", "unix://"+socket)
 }
 
@@ -89,17 +156,53 @@ func engineHostConfigured(args []string) bool {
 	return false
 }
 
-func podmanSocketPath() string {
-	if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
-		rootless := filepath.Join(runtimeDir, "podman", "podman.sock")
-		if _, err := os.Stat(rootless); err == nil {
-			return rootless
+// podmanSocketPath returns the first Podman socket that accepts a connection.
+// The probe also triggers systemd socket activation. In strict mode a stale or
+// inaccessible socket is an error rather than a silent fallback to Docker.
+func podmanSocketPath(strict bool) (string, error) {
+	var (
+		failed string
+		cause  error
+	)
+	for _, socket := range podmanSocketCandidates(os.Getenv("XDG_RUNTIME_DIR"), os.Geteuid() == 0) {
+		ok, err := probePodmanSocket(socket)
+		if ok {
+			return socket, nil
+		}
+		if err != nil && failed == "" {
+			failed, cause = socket, err
 		}
 	}
-	if _, err := os.Stat(rootfulPodmanSocket); err == nil {
-		return rootfulPodmanSocket
+	if strict && failed != "" {
+		return "", fmt.Errorf("cannot connect to Podman socket %s: %w; %s", failed, cause, podmanSocketHints)
 	}
-	return ""
+	return "", nil
+}
+
+// podmanSocketCandidates returns the sockets to probe in preference order. A
+// root process (e.g. sudo podman-compose) prefers the rootful socket even when
+// XDG_RUNTIME_DIR still points at the invoking user's runtime directory.
+func podmanSocketCandidates(runtimeDir string, root bool) []string {
+	if runtimeDir == "" {
+		return []string{rootfulPodmanSocket}
+	}
+	rootless := filepath.Join(runtimeDir, "podman", "podman.sock")
+	if root {
+		return []string{rootfulPodmanSocket, rootless}
+	}
+	return []string{rootless, rootfulPodmanSocket}
+}
+
+func probePodmanSocket(path string) (bool, error) {
+	conn, err := net.DialTimeout("unix", path, podmanSocketProbeTimeout)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	_ = conn.Close()
+	return true, nil
 }
 
 // isPodman reports whether this invocation targets Podman. `podman compose`
