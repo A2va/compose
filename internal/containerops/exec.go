@@ -49,6 +49,10 @@ func (s *Service) Exec(ctx context.Context, projectName string, options api.RunO
 	exec.Workdir = options.WorkingDir
 	exec.Command = options.Command
 	for _, v := range options.Environment {
+		if !strings.Contains(v, "=") {
+			// Docker ignores a bare name; Podman rejects the whole request.
+			continue
+		}
 		err := exec.Env.Set(v)
 		if err != nil {
 			return 0, err

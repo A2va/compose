@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package compose
+package registry
 
 import (
 	"fmt"
@@ -27,8 +27,6 @@ import (
 	clitypes "github.com/docker/cli/cli/config/types"
 	"github.com/opencontainers/go-digest"
 	"gotest.tools/v3/assert"
-
-	"github.com/docker/compose/v5/internal/registry"
 )
 
 func TestRegistryRemoteDigestBearerChallenge(t *testing.T) {
@@ -53,13 +51,13 @@ func TestRegistryRemoteDigestBearerChallenge(t *testing.T) {
 		_, _ = w.Write(manifest)
 	})
 
-	previous := registryHTTPClient
-	registryHTTPClient = server.Client()
-	t.Cleanup(func() { registryHTTPClient = previous })
+	previous := httpClient
+	httpClient = server.Client()
+	t.Cleanup(func() { httpClient = previous })
 
 	named, err := reference.ParseNormalizedNamed(server.Listener.Addr().String() + "/test/image:v1")
 	assert.NilError(t, err)
-	got, err := registryRemoteDigest(t.Context(), named, registry.AuthProviderFunc(func(string) (clitypes.AuthConfig, error) {
+	got, err := RemoteDigest(t.Context(), named, AuthProviderFunc(func(string) (clitypes.AuthConfig, error) {
 		return clitypes.AuthConfig{}, nil
 	}))
 	assert.NilError(t, err)
@@ -72,7 +70,7 @@ func TestRegistryRemoteDigestCanonicalReference(t *testing.T) {
 	want := "sha256:" + strings.Repeat("a", 64)
 	named, err := reference.ParseNormalizedNamed("registry.example.com/team/app@" + want)
 	assert.NilError(t, err)
-	got, err := registryRemoteDigest(t.Context(), named, registry.AuthProviderFunc(func(string) (clitypes.AuthConfig, error) {
+	got, err := RemoteDigest(t.Context(), named, AuthProviderFunc(func(string) (clitypes.AuthConfig, error) {
 		t.Fatal("credentials must not be fetched for a canonical reference")
 		return clitypes.AuthConfig{}, nil
 	}))

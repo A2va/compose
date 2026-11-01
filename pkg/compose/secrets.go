@@ -21,7 +21,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -56,6 +58,19 @@ func (s *composeService) injectFileReferences(ctx context.Context, project *type
 		content, err := s.resolveFileContent(project, sources[mount.Source], mountType)
 		if err != nil {
 			return err
+		}
+		if content == "" && isPodman() && sources[mount.Source].File != "" {
+			// Docker bind-mounts file-sourced references; Podman injects
+			// through a volume, so read the file content instead.
+			filePath := sources[mount.Source].File
+			if !filepath.IsAbs(filePath) {
+				filePath = filepath.Join(project.WorkingDir, filePath)
+			}
+			data, err := os.ReadFile(filePath)
+			if err != nil {
+				return err
+			}
+			content = string(data)
 		}
 		if content == "" {
 			continue

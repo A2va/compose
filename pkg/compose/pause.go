@@ -41,6 +41,10 @@ func (s *composeService) pause(ctx context.Context, projectName string, options 
 	})
 }
 
+func isPausable(ctr container.Summary) bool {
+	return ctr.State == container.StateRunning || ctr.State == container.StatePaused
+}
+
 func (s *composeService) UnPause(ctx context.Context, projectName string, options api.PauseOptions) error {
 	return Run(ctx, func(ctx context.Context) error {
 		return s.unPause(ctx, strings.ToLower(projectName), options)
@@ -58,9 +62,14 @@ func (s *composeService) unPause(ctx context.Context, projectName string, option
 // those of the selected services, one-off containers excluded. Each container fn
 // succeeded on is reported as done with the given status.
 func (s *composeService) forEachPausable(ctx context.Context, projectName string, options api.PauseOptions, status string, fn func(context.Context, container.Summary) error) error {
-	containers, err := s.getContainers(ctx, projectName, oneOffExclude, false, options.Services...)
+	// Podman hides paused containers from the default list, so it must list all
+	// and let the engine reject an already-paused container.
+	containers, err := s.getContainers(ctx, projectName, oneOffExclude, isPodman(), options.Services...)
 	if err != nil {
 		return err
+	}
+	if isPodman() {
+		containers = containers.filter(isPausable)
 	}
 
 	if options.Project != nil {

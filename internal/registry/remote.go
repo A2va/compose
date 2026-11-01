@@ -14,7 +14,7 @@
    limitations under the License.
 */
 
-package compose
+package registry
 
 import (
 	"context"
@@ -29,20 +29,18 @@ import (
 	"github.com/distribution/reference"
 	clitypes "github.com/docker/cli/cli/config/types"
 	"github.com/opencontainers/go-digest"
-
-	"github.com/docker/compose/v5/internal/registry"
 )
 
 // maxManifestSize bounds the manifest we are willing to hash; manifests and
 // token responses are tiny.
 const maxManifestSize = 4 << 20
 
-var registryHTTPClient = &http.Client{}
+var httpClient = &http.Client{}
 
-// registryRemoteDigest resolves the registry (multi-platform index) digest for
+// RemoteDigest resolves the registry (multi-platform index) digest for
 // an image reference. Podman's compat API does not implement Docker's
 // /distribution endpoint, so compose must ask the registry itself.
-func registryRemoteDigest(ctx context.Context, named reference.Named, credentials registry.AuthProvider) (digest.Digest, error) {
+func RemoteDigest(ctx context.Context, named reference.Named, credentials AuthProvider) (digest.Digest, error) {
 	if canonical, ok := named.(reference.Canonical); ok {
 		return canonical.Digest(), nil
 	}
@@ -51,8 +49,8 @@ func registryRemoteDigest(ctx context.Context, named reference.Named, credential
 		tag = tagged.Tag()
 	}
 	host := reference.Domain(named)
-	if host == registry.DefaultNamespace {
-		host = registry.DefaultRegistryHost
+	if host == DefaultNamespace {
+		host = DefaultRegistryHost
 	}
 	repo := reference.Path(named)
 	manifestURL := fmt.Sprintf("https://%s/v2/%s/manifests/%s", host, repo, tag)
@@ -103,7 +101,7 @@ func doManifestRequest(ctx context.Context, manifestURL string, auth clitypes.Au
 	if auth.RegistryToken != "" {
 		req.Header.Set("Authorization", "Bearer "+auth.RegistryToken)
 	}
-	return registryHTTPClient.Do(req)
+	return httpClient.Do(req)
 }
 
 func requestToken(ctx context.Context, challenge string, auth clitypes.AuthConfig, repo string) (string, error) {
@@ -135,7 +133,7 @@ func requestToken(ctx context.Context, challenge string, auth clitypes.AuthConfi
 	if auth.Username != "" || auth.Password != "" {
 		req.SetBasicAuth(auth.Username, auth.Password)
 	}
-	resp, err := registryHTTPClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}

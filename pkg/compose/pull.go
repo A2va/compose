@@ -377,7 +377,7 @@ func ImageDigestResolver(ctx context.Context, file *configfile.ConfigFile, apiCl
 		// Podman's compat API does not implement Docker's /distribution
 		// endpoint, so resolve the index digest against the registry.
 		return func(named reference.Named) (digest.Digest, error) {
-			return registryRemoteDigest(ctx, named, auth)
+			return registry.RemoteDigest(ctx, named, auth)
 		}
 	}
 	return registry.ImageDigestResolver(ctx, auth, apiClient)
