@@ -192,6 +192,9 @@ func (c *Monitor) Start(ctx context.Context) error {
 		case err := <-res.Err:
 			return err
 		case event := <-res.Messages:
+			if isOneOff(event.Actor.Attributes) {
+				continue
+			}
 			if !c.watched(event.Actor.Attributes[api.ServiceLabel]) {
 				continue
 			}
@@ -275,11 +278,21 @@ func (c *Monitor) initialContainers(ctx context.Context) (utils.Set[string], err
 	}
 	containers := utils.Set[string]{}
 	for _, ctr := range initialState.Items {
+		if isOneOff(ctr.Labels) {
+			continue
+		}
 		if c.watched(ctr.Labels[api.ServiceLabel]) && !relaymgr.IsRelay(ctr.Labels) {
 			containers.Add(ctr.ID)
 		}
 	}
 	return containers, nil
+}
+
+// isOneOff reports whether labels identify a `compose run` container. Podman
+// does not always apply the event-stream label filter, so the monitor also
+// filters them out from the events it receives.
+func isOneOff(labels map[string]string) bool {
+	return labels[api.OneoffLabel] == "True"
 }
 
 // watched tells whether a service's containers are watched by this monitor.

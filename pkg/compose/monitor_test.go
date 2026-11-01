@@ -189,6 +189,32 @@ func TestMonitorStartServiceFilter(t *testing.T) {
 	}, cmpRecordedEvents)
 }
 
+func TestMonitorIgnoresOneOffEvents(t *testing.T) {
+	apiClient := mocks.NewMockAPIClient(gomock.NewController(t))
+	m := logstream.NewMonitor(apiClient, "p")
+	got := recordEvents(m)
+
+	messages, _ := expectEventStream(apiClient, []container.Summary{
+		{ID: "c1", Labels: map[string]string{api.ServiceLabel: "db"}},
+	}, 10)
+
+	// only c1 is inspected: the one-off exit must be dropped before that.
+	apiClient.EXPECT().ContainerInspect(gomock.Any(), "c1", gomock.Any()).Return(inspectResult(false, false), nil)
+
+	messages <- containerMessage(events.ActionDie, "run-1", "p-db-run-1", "db", map[string]string{
+		api.OneoffLabel: "True",
+		"exitCode":      "0",
+	})
+	messages <- containerMessage(events.ActionDie, "c1", "c1-name", "db", map[string]string{"exitCode": "0"})
+
+	err := m.Start(t.Context())
+	assert.NilError(t, err)
+
+	assert.DeepEqual(t, *got, []recordedEvent{
+		{eventType: api.ContainerEventExited, id: "c1", source: "c1-name"},
+	}, cmpRecordedEvents)
+}
+
 func TestMonitorStartNoContainers(t *testing.T) {
 	apiClient := mocks.NewMockAPIClient(gomock.NewController(t))
 	m := logstream.NewMonitor(apiClient, "p")

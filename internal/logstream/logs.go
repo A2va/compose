@@ -133,10 +133,16 @@ func (s *Service) InspectWithSlot(ctx context.Context, limiter *semaphore.Weight
 // doesn't support reading logs
 func (s *Service) logContainer(ctx context.Context, limiter *semaphore.Weighted, consumer api.LogConsumer, ctr container.Summary, options api.LogOptions) error {
 	res, err := s.InspectWithSlot(ctx, limiter, ctr.ID)
+	if errdefs.IsNotFound(err) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	err = s.DoLogContainer(ctx, limiter, consumer, naming.ContainerNameWithoutProject(ctr), res, options, nil)
+	if errdefs.IsNotFound(err) {
+		return nil
+	}
 	if errdefs.IsNotImplemented(err) {
 		logrus.Warnf("Can't retrieve logs for %q: %s", naming.CanonicalContainerName(ctr), err.Error())
 		return nil
@@ -174,6 +180,9 @@ func (s *Service) FollowStartedContainersLogs(
 				return err
 			}
 			res, err := s.InspectWithSlot(ctx, limiter, event.ID)
+			if errdefs.IsNotFound(err) {
+				return nil
+			}
 			if err != nil {
 				return err
 			}
@@ -188,7 +197,7 @@ func (s *Service) FollowStartedContainersLogs(
 				Tail:       options.Tail,
 				Timestamps: options.Timestamps,
 			}, turn.Cursor)
-			if errdefs.IsNotImplemented(err) {
+			if errdefs.IsNotImplemented(err) || errdefs.IsNotFound(err) {
 				// ignore
 				return nil
 			}
