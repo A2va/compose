@@ -64,14 +64,14 @@ func TestComposeRunPorts(t *testing.T) {
 	s.Step("run --publish maps the requested port, not the model's",
 		ComposeCmd("run", "--publish", "8081:80", "-d", "back", "/bin/sh", "-c", "sleep 30")).
 		Step("the ad-hoc mapping is live",
-			DockerCmd("ps", "--filter", "label=com.docker.compose.project="+s.Project()),
-			OutputContains("8081->80/tcp"),
-			OutputNotContains("8082->80/tcp")).
+			ComposeCmd("ps", "--all", "--format", "json"),
+			OutputContains(`"PublishedPort":8081`),
+			OutputNotContains(`"PublishedPort":8082`)).
 		Step("run --service-ports maps the model's ports",
 			ComposeCmd("run", "--service-ports", "-d", "back", "/bin/sh", "-c", "sleep 30")).
 		Step("the model's mapping is live",
-			DockerCmd("ps", "--filter", "label=com.docker.compose.project="+s.Project()),
-			OutputContains("8082->80/tcp"))
+			ComposeCmd("ps", "--all", "--format", "json"),
+			OutputContains(`"PublishedPort":8082`))
 }
 
 func TestComposeRunDeps(t *testing.T) {
