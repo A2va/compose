@@ -278,6 +278,9 @@ func (c *CLI) BaseEnvironment() []string {
 			env = append(env, name+"="+value)
 		}
 	}
+	if dockerHostEnv, ok := os.LookupEnv("DOCKER_HOST"); ok {
+		env = append(env, "DOCKER_HOST="+dockerHostEnv)
+	}
 
 	if coverdir, ok := os.LookupEnv("GOCOVERDIR"); ok {
 		_, filename, _, _ := runtime.Caller(0)

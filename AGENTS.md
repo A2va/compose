@@ -3,6 +3,35 @@
 All agents must conform to [AI_POLICY.md](AI_POLICY.md) and the Compose-specific
 rules in [CONTRIBUTING.md](CONTRIBUTING.md#ai-assisted-contributions).
 
+## Podman fork
+
+This fork targets Podman instead of the Docker daemon. Engine access goes
+through Podman's Docker-compatible API (`podman system service`), with a small
+Podman profile layered over upstream Compose.
+
+[PODMAN.md](PODMAN.md) is the plan of record: architecture, the Podman
+v4/v5/v6 compatibility matrix, the **overlay index** — the exhaustive list of
+upstream files this fork touches — and the **overlay commit layout**. Read all
+of it before changing engine-facing code, and keep it ready in the same change:
+
+- Update the overlay index whenever you touch one of those upstream files.
+- Keep `PODMAN.md` current: update its overlay index, documented gaps,
+  environment notes, baseline and counts whenever a fix or e2e change alters
+  them.
+- Respect the overlay commit layout in `PODMAN.md`:
+  - Overlay commits below the baseline hold the engine fixes and their unit
+    tests; put e2e test changes (`pkg/e2e/*`) with the behavior they cover.
+  - The single `docs(podman): refresh the full-suite baseline` commit directly
+    below the CI tip changes **only `PODMAN.md`**: the recorded baseline and
+    its gap/environment notes. No code, harness or script changes.
+  - The single `ci(podman): …` commit owns the workflows, CI and the
+    harness/scripts those workflows invoke (`.github/workflows/*`,
+    `.github/scripts/*`, CI build config), including the e2e denylist, and
+    **must remain the branch tip**. Never add a commit above it.
+- Before finishing, inspect `git log` and confirm that layout. Use the
+  `git commit --fixup` + `--autosquash` recipe documented in `PODMAN.md` to fold
+  a change into its layer; never leave a new commit on top of the CI commit.
+
 ## Build & Test
 
 - Build: `make build`
