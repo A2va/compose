@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	compose "github.com/compose-spec/compose-go/v2/types"
@@ -41,6 +42,22 @@ func ToMobyEnv(environment compose.MappingWithEquals) []string {
 	// marshaled verbatim into the job spec sent to the Engine, whose spec
 	// hash is order-sensitive. Keys are unique, so sorting is safe.
 	slices.Sort(env)
+	return env
+}
+
+// toContainerEnv converts a service environment for the container create
+// request. Podman ignores bare names (the image's value wins) instead of
+// treating them as unset; an explicit empty value is the closest equivalent.
+func toContainerEnv(environment compose.MappingWithEquals) []string {
+	env := ToMobyEnv(environment)
+	if !isPodman() {
+		return env
+	}
+	for i, v := range env {
+		if !strings.Contains(v, "=") {
+			env[i] = v + "="
+		}
+	}
 	return env
 }
 
