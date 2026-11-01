@@ -21,8 +21,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -51,11 +50,6 @@ func (s *composeService) injectConfigs(ctx context.Context, project *types.Proje
 }
 
 func (s *composeService) injectFileReferences(ctx context.Context, project *types.Project, service types.ServiceConfig, id string, mountType mountType) error {
-	if isPodman() {
-		// Podman cannot copy files into a container that is not running yet;
-		// content-based secrets/configs are bind-mounted at create time instead.
-		return nil
-	}
 	mounts, sources := s.getFilesAndMap(project, service, mountType)
 
 	for _, mount := range mounts {
@@ -208,30 +202,17 @@ func (s *composeService) copyFileToContainer(ctx context.Context, id, content st
 	_, err = s.apiClient().CopyToContainer(ctx, id, client.CopyToContainerOptions{
 		DestinationPath: "/",
 		Content:         &b,
-		CopyUIDGID:      file.UID != "" || file.GID != "",
+		// Podman interprets copyUIDGID as "chown to the daemon user"; the tar
+		// header already carries the declared uid/gid.
+		CopyUIDGID: !isPodman() && (file.UID != "" || file.GID != ""),
 	})
 	return err
 }
 
-// podmanFileReferenceFile materializes content-based secrets/configs on the
-// host so they can be bind-mounted: Podman's compat API silently drops copies
-// into a container that is not running yet.
-// shortcut: files live under $TMPDIR/compose-podman and are not removed on
-// `down`; revisit if stale copies become a problem.
-func podmanFileReferenceFile(projectName string, mountType mountType, name, content string) (string, error) {
-	dir := filepath.Join(os.TempDir(), "compose-podman", projectName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(dir, string(mountType)+"-"+name)
-	// Remove first: a previous run may have left the file read-only.
-	_ = os.Remove(path)
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
-}
-
+// createTar builds the archive used to inject a secret or config: relative
+// names and explicit parent directories work across engines (Podman drops
+// absolute names and needs the directories), and the header carries the
+// declared uid/gid/mode.
 func createTar(env string, config types.FileReferenceConfig) (bytes.Buffer, error) {
 	value := []byte(env)
 	b := bytes.Buffer{}
@@ -257,10 +238,23 @@ func createTar(env string, config types.FileReferenceConfig) (bytes.Buffer, erro
 		gid = v
 	}
 
+	name := strings.TrimPrefix(config.Target, "/")
+	if dir := path.Dir(name); dir != "." {
+		parts := strings.Split(dir, "/")
+		for i := range parts {
+			err := tarWriter.WriteHeader(&tar.Header{
+				Name:     strings.Join(parts[:i+1], "/") + "/",
+				Mode:     0o755,
+				Typeflag: tar.TypeDir,
+				ModTime:  time.Now(),
+			})
+			if err != nil {
+				return bytes.Buffer{}, err
+			}
+		}
+	}
 	header := &tar.Header{
-		// Podman's compat API silently drops tar entries with absolute names;
-		// relative names are equivalent because compose extracts at "/".
-		Name:    strings.TrimPrefix(config.Target, "/"),
+		Name:    name,
 		Size:    int64(len(value)),
 		Mode:    int64(mode),
 		ModTime: time.Now(),
