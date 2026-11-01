@@ -8,9 +8,10 @@ Status (2026-11-01): P0, P1, P2 and P3 implemented — engine detection, socket
 defaulting, classic-build forcing, registry digest fallback, e2e `DOCKER_HOST`
 support, link emulation, secret ownership, the P1 compat shims (port ranges,
 `json-file`, `dockerfile_inline`, secrets/configs), build-arg image identity,
-watch sync into existing paths, one-off/log-attach races and a CI matrix that
-runs the e2e suite against Podman 4.3 (Debian 12), 4.9 (Ubuntu 24.04) and
-current Fedora. Known Podman gaps are listed below.
+watch sync into existing paths, one-off/log-attach races, default-bridge link
+injection and a CI matrix that runs the e2e suite against Podman 4.3
+(Debian 12), 4.9 (Ubuntu 24.04) and current Fedora. Known Podman gaps are
+listed below.
 
 ## Goal
 
@@ -114,6 +115,8 @@ All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`,
 - `podman_links.go` — emulates legacy `links` as network aliases on the link
   target (Podman rejects `HostConfig.Links`). The alias is resolvable by every
   container on the shared network, a superset of Docker's per-source entry.
+  On the default bridge, which has no DNS, the same aliases are added to the
+  source's `/etc/hosts` after start.
 
 ## Known Podman gaps (documented, not worked around)
 
@@ -128,8 +131,10 @@ These are engine limitations, not missing compose features:
 - **Build log and error text** — tests asserting Docker's classic
   "naming to … done" output or `No such image: …` wording do not match
   buildah's output, although the build succeeds.
-- **Legacy `links` on the default bridge** — Podman's default bridge has no
-  DNS or alias support, so link aliases only work on user-defined networks.
+- **Default-bridge links in shell-less images** — the aliases are appended to
+  `/etc/hosts` with `sh` after start; scratch/distroless images keep the old
+  no-DNS behavior. An app resolving names during its first instruction can
+  still race the injection.
 - **Static network address metadata** — the address is assigned, but Podman
   reports `IPAMConfig` as `null` in inspect; assert `IPAddress` instead.
   (`TestIPAMConfig` still reads the metadata field.)
@@ -167,7 +172,9 @@ systemd and local runs can be rootless):
 
 Whole suite, serial, with `TMPDIR` under `/tmp/opencode`:
 
-`go test -tags e2e ./pkg/e2e -parallel 1` → **186 pass / 42 fail / 11 skip**.
+`go test -tags e2e ./pkg/e2e -parallel 1` → **186 pass / 42 fail / 11 skip**
+before the default-bridge link injection; that fix makes `TestNetworkLinks`
+pass, so the expected baseline is **187 pass / 41 fail / 11 skip**.
 The skips are optional Docker Desktop, model/buildx and multi-platform cases.
 Every remaining failure falls into the categories above:
 
@@ -177,8 +184,7 @@ Every remaining failure falls into the categories above:
   `TestDependsOnMultipleProviders`, `TestBridgeConvertOutputNotEmptyConfirmed`,
   `TestConvertAndTransformList`, `TestConvertBuildOnlyService`.
 - Engine behavior: `TestIPAMConfig`, `TestLocalComposeLogsFollow`,
-  `TestNetworkLinks`, `TestNoDepsNetworkMode`,
-  `TestUpAttachedTerminatesOnExternalStop`,
+  `TestNoDepsNetworkMode`, `TestUpAttachedTerminatesOnExternalStop`,
   `TestRebuildOnDotEnvWithExternalNetwork`, `TestLoggingDriver`.
 - Environment on this host: `TestLocalComposeUp` (no systemd),
   `TestNetworkConfigChanged` (host subnet), `TestLocalComposeVolume`
@@ -268,8 +274,9 @@ skips with the reasons recorded here.
   24.04) and current Fedora, with a classic-build smoke on each version.
 - **P3 (implemented)** — close the compose-side gaps found by the suite:
   build-arg image identity despite buildah's cache, watch sync into existing
-  paths, one-off event filtering and log attach to already-removed containers;
-  widen the CI subset with the tests this unlocked.
+  paths, one-off event filtering, log attach to already-removed containers and
+  default-bridge link injection; widen the CI subset with the tests this
+  unlocked.
 - **P4** (optional) — Podman niceties: rootless hints in errors, socket
   auto-activation check, `podman build` shell-out for multi-arch if ever
   needed.
