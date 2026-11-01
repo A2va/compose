@@ -3,6 +3,18 @@
 All agents must conform to [AI_POLICY.md](AI_POLICY.md) and the Compose-specific
 rules in [CONTRIBUTING.md](CONTRIBUTING.md#ai-assisted-contributions).
 
+## Podman fork
+
+This fork targets Podman instead of the Docker daemon. Engine access goes
+through Podman's Docker-compatible API (`podman system service`), with a small
+Podman profile layered over upstream Compose.
+
+[PODMAN.md](PODMAN.md) is the plan of record: architecture, the Podman
+v4/v5/v6 compatibility matrix, and the **overlay index** — the exhaustive list
+of upstream files this fork touches. Read it before changing engine-facing
+code, and update the overlay index in the same change whenever you touch one of
+those upstream files.
+
 ## Build & Test
 
 - Build: `make build`
