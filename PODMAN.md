@@ -237,9 +237,11 @@ skips with the reasons recorded here.
 - CI:
   - `.github/workflows/sync-upstream.yml` automates the rebase recipe above.
     Daily it compares upstream's latest release with `.github/upstream-release`;
-    on a new tag it rebases, builds, unit-tests, uploads the binary artifact and
-    opens a PR — or files a rebase-conflict issue when the overlay needs a
-    manual fix. Set the repo to allow GitHub Actions to create pull requests.
+    on a new tag it rebases `podman` onto it, runs the unit suite and the e2e
+    matrix below, then force-pushes `podman` and publishes a GitHub release
+    (`podman-vX.Y.Z`) with the standalone binary. A failed rebase or test
+    regression leaves `podman` and the releases untouched and files an issue
+    instead. Set the repo to allow GitHub Actions to create releases.
   - `.github/workflows/podman-e2e.yml` runs the e2e smoke suite against the
     Podman matrix. The static test binary executes inside a privileged
     container (`debian:12`, `ubuntu:24.04`, `fedora:latest`), so old Podman

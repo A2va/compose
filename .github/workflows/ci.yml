@@ -13,6 +13,7 @@ on:
       - 'main'
     tags:
       - 'v*'
+      - 'podman-v*'
   pull_request:
   workflow_dispatch:
     inputs:
@@ -388,7 +389,9 @@ jobs:
           echo "$NEEDS" | jq -e 'to_entries | all(.[]; .value.result == "success" or ((.key | IN("bin-image-test", "relay-image-test")) and .value.result == "skipped"))' > /dev/null
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Fork releases are built from podman-v* tags that sync-upstream creates;
+    # upstream v* tags stay drafts and are skipped in the fork.
+    if: startsWith(github.ref, 'refs/tags/podman-v') || (startsWith(github.ref, 'refs/tags/v') && !github.event.repository.fork)
     permissions:
       contents: write # to create a release (softprops/action-gh-release)
     runs-on: ubuntu-latest
@@ -420,7 +423,7 @@ jobs:
         with:
           files: ./bin/release/*
           generate_release_notes: true
-          draft: true
+          draft: ${{ !github.event.repository.fork }}
           # never replace assets already uploaded to an existing release
           # (softprops updates an existing release for the tag instead of failing)
           overwrite_files: false
