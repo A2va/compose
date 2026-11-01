@@ -93,6 +93,7 @@ binary, `pkg/compose/build_bake.go:182`).
 | `pkg/compose/create.go` | Podman-only: expand published port ranges by replica index (`podmanHostPort`), map `json-file` to `k8s-file`, mount an anonymous volume at `/run/secrets` for secrets (`podmanSecretVolume`), skip structured secret/config mounts, skip legacy `links` and publish link aliases on the target's endpoints (`podmanLinkAliases`). |
 | `pkg/compose/pull.go` | If Podman, resolve image digests via `registry.RemoteDigest` (`internal/registry/remote.go`) because Podman has no `GET /distribution/{name}/json`. |
 | `pkg/compose/secrets.go` | Tar entries use relative names and include parent directories, and Podman skips `copyUIDGID` so the declared uid/gid/mode survive extraction. |
+| `pkg/compose/ps.go` | Podman <1.44 omits EXPOSE'd ports from `/containers/json` and the host IP from published ports; restore both for `compose ps`/`port`. |
 | `pkg/e2e/framework.go` | Pass `DOCKER_HOST` through to e2e commands, like `DOCKER_CONTEXT`. |
 
 All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`), which never conflict on rebase.
@@ -236,7 +237,7 @@ skips with the reasons recorded here.
 
 - **P0 (implemented)** — detection + socket defaulting + classic-build forcing.
 - **P1 (implemented)** — registry digest fallback, port ranges, `json-file`,
-  `dockerfile_inline`, secret ownership (uid/gid/mode), `links` via network
+  `dockerfile_inline`, secret ownership (uid/gid/mode), `ps` port display, `links` via network
   aliases; full-suite baseline documented above.
 - **P2** — Debian 12 / Podman 4.3 validation job; CI for the matrix.
 - **P3** (optional) — Podman niceties: rootless hints in errors, socket
