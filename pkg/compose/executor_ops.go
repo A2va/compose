@@ -169,9 +169,15 @@ func (exec *planExecutor) execStartContainer(ctx context.Context, op Operation) 
 	}
 
 	startMx.Lock()
-	defer startMx.Unlock()
 	_, err = exec.compose.apiClient().ContainerStart(ctx, id, client.ContainerStartOptions{})
-	return err
+	startMx.Unlock()
+	if err != nil {
+		return err
+	}
+	if err := exec.compose.applyPodmanLinkHosts(ctx, exec.project.Name, *op.Service, id); err != nil {
+		logrus.Warnf("unable to inject links into %s: %v", id, err)
+	}
+	return nil
 }
 
 // resolveContainerID returns the ID of the container an operation targets:
