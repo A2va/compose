@@ -5,7 +5,7 @@ against Podman v4+, with a minimal, rebase-friendly overlay. This document is th
 agreed plan of record; the "Overlay index" section doubles as the rebase checklist.
 
 Status (2026-11-01): P0 and P1 implemented — engine detection, socket defaulting,
-classic-build forcing, registry digest fallback and the P1 compat shims (port ranges, `json-file`, `dockerfile_inline`, secrets/configs).
+classic-build forcing, registry digest fallback, link emulation and the P1 compat shims (port ranges, `json-file`, `dockerfile_inline`, secrets/configs).
 Known Podman gaps are listed below; P2 (Debian 12 matrix) remains.
 
 ## Goal
@@ -90,7 +90,7 @@ binary, `pkg/compose/build_bake.go:182`).
 | `cmd/main.go` | Call `compose.ConfigurePodmanHost()` before `plugin.Run`. That helper (`pkg/compose/podman.go`) defaults `DOCKER_HOST` to the rootless/rootful Podman socket when the profile is on and no `DOCKER_HOST`/`DOCKER_CONTEXT`/`-H`/`--host`/`--context` is set; explicit `podman` with no socket exits with an actionable message. |
 | `pkg/compose/build_bake.go` | If Podman, return classic (`POST /build?version=1`, served by buildah). Podman has no `/grpc` or `/session`, so bake cannot work; without buildx upstream already falls back, this makes it deterministic. |
 | `pkg/compose/build_classic.go` | Materialize `build.dockerfile_inline` to a temp file for the classic builder (it otherwise requires a Dockerfile on disk). |
-| `pkg/compose/create.go` | Podman-only: expand published port ranges by replica index (`podmanHostPort`), map `json-file` to `k8s-file`, append secret/config binds from `podmanFileReferenceBinds`, skip structured secret/config mounts. |
+| `pkg/compose/create.go` | Podman-only: expand published port ranges by replica index (`podmanHostPort`), map `json-file` to `k8s-file`, append secret/config binds from `podmanFileReferenceBinds`, skip structured secret/config mounts, skip legacy `links` and publish link aliases on the target's endpoints (`podmanLinkAliases`). |
 | `pkg/compose/pull.go` | If Podman, resolve image digests via `registryRemoteDigest` (`pkg/compose/podman_registry.go`) because Podman has no `GET /distribution/{name}/json`. |
 | `pkg/compose/secrets.go` | Tar entries use relative names (Podman silently drops absolute ones) and Podman skips post-create injection (files are bind-mounted instead). |
 
@@ -104,14 +104,14 @@ All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`), whic
 - `podman_secrets.go` — secret/config bind strings with `:z` (SELinux), content
   materialized under `$TMPDIR/compose-podman/<project>/` so user files are
   never relabeled.
+- `podman_links.go` — emulates legacy `links` as network aliases on the link
+  target (Podman rejects `HostConfig.Links`). The alias is resolvable by every
+  container on the shared network, a superset of Docker's per-source entry.
 
 ## Known Podman gaps (documented, not worked around)
 
 These are engine limitations, not missing compose features:
 
-- **`links:`** — Podman removed container links; its compat API rejects
-  `HostConfig.Links`. Use service DNS / `networks: aliases` instead.
-  (`TestNetworkAliases` is expected to fail against Podman.)
 - **Secret `uid`/`gid`/`mode`** — content is correct, but rootless host bind
   mounts cannot assume arbitrary container uids/gids. Compose already warns
   that these are Swarm-only; Docker happens to apply them via its archive API.
@@ -178,7 +178,8 @@ These are engine limitations, not missing compose features:
 
 - **P0 (implemented)** — detection + socket defaulting + classic-build forcing.
 - **P1 (implemented)** — registry digest fallback, e2e `DOCKER_HOST` support,
-  port ranges, `json-file`, `dockerfile_inline`, secret/config `:z` binds;
+  port ranges, `json-file`, `dockerfile_inline`, secret/config `:z` binds,
+  `links` via network aliases;
   e2e smoke matrix green except the documented engine gaps.
 - **P2** — Debian 12 / Podman 4.3 validation job (H2); CI for the matrix.
 - **P3** (optional) — Podman niceties: rootless hints in errors, socket
