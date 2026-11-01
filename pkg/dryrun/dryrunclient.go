@@ -94,6 +94,11 @@ func (d *DryRunClient) resolve(ctx context.Context, ref string) error {
 	_, err = d.apiClient.DistributionInspect(ctx, named.String(), client.DistributionInspectOptions{
 		EncodedRegistryAuth: auth,
 	})
+	if err != nil {
+		// Podman's compat API has no /distribution endpoint; resolve the
+		// manifest from the registry directly, as the pull would.
+		_, err = registry.RemoteDigest(ctx, named, d.credentials)
+	}
 	return err
 }
 

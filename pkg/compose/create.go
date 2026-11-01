@@ -375,7 +375,7 @@ func (s *composeService) getCreateConfigs(ctx context.Context,
 		NetworkDisabled: service.NetworkMode == "disabled",
 		Labels:          labels,
 		StopSignal:      service.StopSignal,
-		Env:             ToMobyEnv(env),
+		Env:             toContainerEnv(env),
 		Healthcheck:     healthcheck,
 		StopTimeout:     ToSeconds(service.StopGracePeriod),
 	} // VOLUMES/MOUNTS/FILESYSTEMS

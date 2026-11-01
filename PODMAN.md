@@ -4,9 +4,11 @@ This fork makes `docker/compose` (the reference Compose implementation) run nati
 against Podman v4+, with a minimal, rebase-friendly overlay. This document is the
 agreed plan of record; the "Overlay index" section doubles as the rebase checklist.
 
-Status (2026-11-01): P0 and P1 implemented — engine detection, socket defaulting,
-classic-build forcing, registry digest fallback, link emulation, secret ownership and the P1 compat shims (port ranges, `json-file`, `dockerfile_inline`, secrets/configs).
-Known Podman gaps are listed below; P2 (Debian 12 matrix) remains.
+Status (2026-11-01): P0 and P1 implemented — engine detection, socket
+defaulting, classic-build forcing, registry digest fallback, link emulation,
+secret ownership and the P1 compat shims (port ranges, `json-file`,
+`dockerfile_inline`, secrets/configs). The full-suite baseline and remaining
+engine gaps are documented below.
 
 ## Goal
 
@@ -46,12 +48,10 @@ Rationale:
 
 | Podman | Reports Docker API | Status in this fork |
 |---|---|---|
-| 4.3.x (Debian 12) | 1.40 | supported (client floor is exactly 1.40) — see hazard H2 |
+| 4.3.x (Debian 12) | 1.40 | supported |
 | 4.4–4.9 | 1.40/1.41 | supported |
 | 5.0–5.7 | 1.41 | supported |
-| 5.8+ / 6.x | 1.44 | supported (best parity) |
-
-Validated live against Podman 5.8.9 (Fedora 44).
+| 5.8+ / 6.x | 1.44 | supported |
 
 ## Alternatives considered (rejected)
 
@@ -91,14 +91,15 @@ binary, `pkg/compose/build_bake.go:182`).
 | `pkg/compose/build_bake.go` | If Podman, return classic (`POST /build?version=1`, served by buildah). Podman has no `/grpc` or `/session`, so bake cannot work; without buildx upstream already falls back, this makes it deterministic. |
 | `pkg/compose/build_classic.go` | Materialize `build.dockerfile_inline` to a temp file for the classic builder (it otherwise requires a Dockerfile on disk). |
 | `pkg/compose/create.go` | Podman-only: expand published port ranges by replica index (`podmanHostPort`), map `json-file` to `k8s-file`, mount an anonymous volume at `/run/secrets` for secrets (`podmanSecretVolume`), skip structured secret/config mounts, skip legacy `links` and publish link aliases on the target's endpoints (`podmanLinkAliases`). |
-| `pkg/compose/pull.go` | If Podman, resolve image digests via `registryRemoteDigest` (`pkg/compose/podman_registry.go`) because Podman has no `GET /distribution/{name}/json`. |
+| `pkg/compose/pull.go` | If Podman, resolve image digests via `registry.RemoteDigest` (`internal/registry/remote.go`) because Podman has no `GET /distribution/{name}/json`. |
 | `pkg/compose/secrets.go` | Tar entries use relative names and include parent directories, and Podman skips `copyUIDGID` so the declared uid/gid/mode survive extraction. |
+| `pkg/e2e/framework.go` | Pass `DOCKER_HOST` through to e2e commands, like `DOCKER_CONTEXT`. |
 
 All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`), which never conflict on rebase.
 
 **Podman-only helpers (new files):**
 - `podman.go` — profile detection, socket selection, `isPodman()`.
-- `podman_registry.go` — minimal registry client (Bearer challenge, OCI/Docker
+- `internal/registry/remote.go` — minimal registry client (Bearer challenge, OCI/Docker
   manifest `Accept` headers, body hashing) used by digest resolution. No new
   dependencies.
 - `podman_secrets.go` — anonymous volume at `/run/secrets` so archive injection
@@ -113,12 +114,72 @@ These are engine limitations, not missing compose features:
 
 - **Docker-only log drivers** (e.g. `fluentd`) — Podman supports
   `k8s-file`/`journald`/`none`/`passthrough`; `json-file` is mapped to
-  `k8s-file`. `TestLoggingDriver` (fluentd) is expected to fail.
+  `k8s-file`.
 - **BuildKit-only build features** (multi-arch, build secrets, ssh,
-  additional contexts) — classic builder limitation; upstream already prints a
-  clear error. Podman builds with buildah.
-- **Swarm features, `compose alpha` provider/relay, Docker Desktop** — not
-  applicable to Podman.
+  additional contexts, builder selection) — classic builder limitation;
+  upstream already prints a clear error. Podman builds with buildah.
+- **Build log format** — tests asserting Docker's classic "naming to … done"
+  output do not match buildah's output, although the build succeeds.
+- **Buildah cache and build args** — buildah ignores a changed build-arg when
+  the affected step is cacheable (verified: same image id until `--no-cache`),
+  so compose cannot tell a rebuilt image from the previous one.
+- **Legacy `links` on the default bridge** — Podman's default bridge has no
+  DNS or alias support, so link aliases only work on user-defined networks.
+- **Static network addresses** (`ipv4_address`) — Podman's compat create does
+  not apply them; containers need a post-create connect.
+- **Dependent-container removal** — Podman refuses to remove a container that
+  other containers share a netns with, where Docker force-removes.
+- **Restart backoff state** — Podman does not expose Docker's
+  `State.Restarting` backoff to clients.
+- **Watch sync onto existing paths** — Podman's copier errors when a tar
+  directory entry already exists instead of merging.
+- **`logs --follow` for containers created later** — the follow stream does
+  not pick up replicas created after it started.
+- **One-off removal race** — Podman reaps `run --rm` containers fast enough
+  that a concurrent monitor can observe a missing container.
+- **Inspect network mode** — Podman reports `HostConfig.NetworkMode` as
+  `bridge` for containers attached to an external network.
+- **Swarm features, `compose alpha` provider/relay/bridge, Docker Desktop** —
+  not applicable to Podman; `TestProvider*`, `TestDependsOnMultipleProviders`
+  and the bridge convert tests are excluded.
+
+Environment-dependent failures (not Podman bugs, but the CI container has no
+systemd and local runs can be rootless):
+
+- **Healthchecks** — Podman 4.3 schedules them with systemd timers; without
+  systemd they never leave `starting` (`TestLocalComposeUp`).
+- **Ping-based tests in rootless mode** — rootless containers lack
+  `CAP_NET_RAW` here (`TestWatchExec`, `TestUpStopWithLogsMixed`); they pass
+  with rootful Podman in CI.
+- **Fixed subnets** — tests hard-coding `192.168.0.0/16` collide with the host
+  network of the test machine (`TestNetworkConfigChanged`).
+- **SELinux relabel mode** — `TestLocalComposeVolume` asserts the inspect
+  `Mode:"z"` field, which only exists with SELinux labelling enabled.
+
+### Full-suite baseline (Podman 5.8.9 rootless, 2026-11-01)
+
+`go test -tags e2e ./pkg/e2e` → **183 pass / 47 fail / 9 skip**. Every failure
+falls into the categories above:
+
+- BuildKit/buildx/build-log: `TestBuild*`, `TestComposeRunBuild`,
+  `TestRunBuildOnce{Dependency,NestedDependencies,NoDeps}`.
+- Alpha provider/relay/bridge: `TestProvider*`,
+  `TestDependsOnMultipleProviders`, `TestBridgeConvertOutputNotEmptyConfirmed`,
+  `TestConvertAndTransformList`, `TestConvertBuildOnlyService`.
+- Engine behavior: `TestIPAMConfig`, `TestLocalComposeLogsFollow`,
+  `TestNetworkLinks`, `TestNoDepsNetworkMode`, `TestScaleDownNoRecreate`,
+  `TestUpAttachedTerminatesOnExternalStop`, `TestWatchSyncIntoSymlinkedDirectory`,
+  `TestCascadeIgnoresOneOffContainer`, `TestRebuildOnDotEnvWithExternalNetwork`,
+  `TestAttachRestart`, `TestLoggingDriver`.
+- Environment/flaky on this host: `TestLocalComposeUp` (no systemd),
+  `TestUpStopWithLogsMixed`/`TestWatchExec` (rootless ping),
+  `TestWatchMultiServices` (watch timing), `TestNetworkConfigChanged`
+  (host subnet), `TestLocalComposeVolume` (SELinux mode field),
+  `TestExposeRange` (passes when rerun).
+
+The CI script runs the passing Podman-relevant subset; expanding it to the
+whole suite requires either fixing the engine gaps above or marking these as
+skips with the reasons recorded here.
 
 ## Known hazards (tracked, with mitigations)
 
@@ -128,10 +189,9 @@ These are engine limitations, not missing compose features:
   `MinAPIVersion` rises above Podman's reported version, pin the previous
   client module in `go.mod` (or carry a one-line patch) and note it here.
 - **H2 — Podman 4.3 build endpoint rejects some classic-builder query params**
-  (containers/podman#15928, fixed in 4.4). Verify on Debian 12 first; if it
-  bites, sanitize the `/build` query (drop empty `cachefrom`, `ulimits=null`,
-  etc.) in a small `client.APIClient` decorator following the `DryRunClient`
-  pattern — no upstream-file changes needed.
+  (containers/podman#15928, fixed in 4.4). The CI build smoke runs on the
+  Debian 12 leg and passes, so the parameter set sent by the pinned client is
+  accepted. Keep an eye on it when bumping the moby client.
 - **H3 — resolved:** Podman mounts a tmpfs at `/run/secrets` (so plain writes
   to a stopped container are shadowed) and treats `copyUIDGID=true` as "chown
   to the daemon user". Secrets now go through an anonymous volume and the
@@ -175,11 +235,10 @@ These are engine limitations, not missing compose features:
 ## Work plan
 
 - **P0 (implemented)** — detection + socket defaulting + classic-build forcing.
-- **P1 (implemented)** — registry digest fallback, e2e `DOCKER_HOST` support,
-  port ranges, `json-file`, `dockerfile_inline`, secret ownership (uid/gid/mode),
-  `links` via network aliases;
-  e2e smoke matrix green except the documented engine gaps.
-- **P2** — Debian 12 / Podman 4.3 validation job (H2); CI for the matrix.
+- **P1 (implemented)** — registry digest fallback, port ranges, `json-file`,
+  `dockerfile_inline`, secret ownership (uid/gid/mode), `links` via network
+  aliases; full-suite baseline documented above.
+- **P2** — Debian 12 / Podman 4.3 validation job; CI for the matrix.
 - **P3** (optional) — Podman niceties: rootless hints in errors, socket
   auto-activation check, `podman build` shell-out for multi-arch if ever
   needed.
