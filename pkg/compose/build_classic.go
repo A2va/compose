@@ -360,14 +360,19 @@ func (s *composeService) classicAuthConfigs() (map[string]registry.AuthConfig, e
 
 func imageBuildOptions(proxyConfigs map[string]*string, project *types.Project, service types.ServiceConfig, options api.BuildOptions) client.ImageBuildOptions {
 	config := service.Build
+	buildArgs := resolveAndMergeBuildArgs(proxyConfigs, project, service, options)
+	labels := config.Labels
+	if isPodman() && len(buildArgs) > 0 {
+		labels = withPodmanBuildArgsLabel(labels, buildArgs)
+	}
 	return client.ImageBuildOptions{
 		Version:     buildtypes.BuilderV1,
 		Tags:        config.Tags,
 		NoCache:     config.NoCache,
 		Remove:      true,
 		PullParent:  config.Pull,
-		BuildArgs:   resolveAndMergeBuildArgs(proxyConfigs, project, service, options),
-		Labels:      config.Labels,
+		BuildArgs:   buildArgs,
+		Labels:      labels,
 		NetworkMode: config.Network,
 		ExtraHosts:  config.ExtraHosts.AsList(":"),
 		Target:      config.Target,
