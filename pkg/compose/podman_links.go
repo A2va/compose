@@ -22,6 +22,9 @@ import (
 	"strings"
 
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	"github.com/sirupsen/logrus"
 )
 
 // containerLinks resolves Docker-style links for the container being created.
@@ -67,4 +70,75 @@ func serviceOnNetwork(service types.ServiceConfig, networkKey string) bool {
 	}
 	_, ok := service.Networks[networkKey]
 	return ok
+}
+
+// applyPodmanLinkHosts writes legacy links into the source container's
+// /etc/hosts after start. Podman's default bridge has no DNS, and it assigns
+// the target's address at start, too late for HostConfig.ExtraHosts.
+func (s *composeService) applyPodmanLinkHosts(ctx context.Context, projectName string, service types.ServiceConfig, sourceID string) error {
+	if !isPodman() || (service.NetworkMode != "bridge" && service.NetworkMode != "default") || len(service.Links) == 0 {
+		return nil
+	}
+	targets := map[string]Containers{}
+	for _, rawLink := range service.Links {
+		target, _, _ := strings.Cut(rawLink, ":")
+		if _, ok := targets[target]; ok {
+			continue
+		}
+		containers, err := s.getContainers(ctx, projectName, oneOffExclude, true, target)
+		if err != nil {
+			return err
+		}
+		targets[target] = containers
+	}
+	hosts := podmanLinkHostEntries(service.Links, targets)
+	if len(hosts) == 0 {
+		return nil
+	}
+	cmd := append([]string{"sh", "-c", `for e in "$@"; do h="${e%%:*}"; ip="${e#*:}"; grep -q " $h$" /etc/hosts || echo "$ip $h" >> /etc/hosts; done`, "sh"}, hosts...)
+	exec, err := s.apiClient().ExecCreate(ctx, sourceID, client.ExecCreateOptions{Cmd: cmd})
+	if err != nil {
+		// The image may be shell-less; keep the current no-DNS behavior
+		// rather than failing the start over a best-effort emulation.
+		logrus.Debugf("unable to inject links into %s: %v", sourceID, err)
+		return nil
+	}
+	if _, err := s.apiClient().ExecStart(ctx, exec.ID, client.ExecStartOptions{Detach: true}); err != nil {
+		logrus.Debugf("unable to run link injection in %s: %v", sourceID, err)
+	}
+	return nil
+}
+
+func podmanLinkHostEntries(links []string, targets map[string]Containers) []string {
+	var hosts []string
+	for _, rawLink := range links {
+		target, alias, ok := strings.Cut(rawLink, ":")
+		if !ok {
+			alias = target
+		}
+		for _, ctr := range targets[target] {
+			ip := podmanContainerIP(ctr)
+			if ip == "" {
+				continue
+			}
+			hosts = append(hosts, target+":"+ip)
+			if alias != target {
+				hosts = append(hosts, alias+":"+ip)
+			}
+		}
+	}
+	slices.Sort(hosts)
+	return slices.Compact(hosts)
+}
+
+func podmanContainerIP(ctr container.Summary) string {
+	if ctr.NetworkSettings == nil {
+		return ""
+	}
+	for _, endpoint := range ctr.NetworkSettings.Networks {
+		if endpoint != nil && endpoint.IPAddress.IsValid() {
+			return endpoint.IPAddress.String()
+		}
+	}
+	return ""
 }
