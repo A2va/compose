@@ -386,6 +386,13 @@ func (s *composeService) getCreateConfigs(ctx context.Context,
 	if err != nil {
 		return createConfigs{}, err
 	}
+	if isPodman() {
+		fileBinds, err := podmanFileReferenceBinds(*p, service)
+		if err != nil {
+			return createConfigs{}, err
+		}
+		binds = append(binds, fileBinds...)
+	}
 
 	// NETWORKING
 	links, err := s.getLinks(ctx, p.Name, service, number)
@@ -404,7 +411,7 @@ func (s *composeService) getCreateConfigs(ctx context.Context,
 	if err != nil {
 		return createConfigs{}, err
 	}
-	portBindings, err := buildContainerPortBindingOptions(service)
+	portBindings, err := buildContainerPortBindingOptions(service, number)
 	if err != nil {
 		return createConfigs{}, err
 	}
@@ -416,6 +423,10 @@ func (s *composeService) getCreateConfigs(ctx context.Context,
 		logConfig = container.LogConfig{
 			Type:   service.Logging.Driver,
 			Config: service.Logging.Options,
+		}
+		if isPodman() && logConfig.Type == "json-file" {
+			// Podman has no json-file driver; k8s-file is its local JSON log format.
+			logConfig.Type = "k8s-file"
 		}
 	}
 	securityOpts, unconfined, err := parseSecurityOpts(p, service.SecurityOpt)
@@ -976,7 +987,7 @@ func buildContainerPorts(s types.ServiceConfig) (network.PortSet, error) {
 	return exposedPorts, nil
 }
 
-func buildContainerPortBindingOptions(s types.ServiceConfig) (network.PortMap, error) {
+func buildContainerPortBindingOptions(s types.ServiceConfig, number int) (network.PortMap, error) {
 	bindings := network.PortMap{}
 	for _, port := range s.Ports {
 		var err error
@@ -991,12 +1002,44 @@ func buildContainerPortBindingOptions(s types.ServiceConfig) (network.PortMap, e
 				return nil, err
 			}
 		}
+		published := port.Published
+		if isPodman() {
+			published, err = podmanHostPort(published, number)
+			if err != nil {
+				return nil, err
+			}
+		}
 		bindings[p] = append(bindings[p], network.PortBinding{
 			HostIP:   hostIP,
-			HostPort: port.Published,
+			HostPort: published,
 		})
 	}
 	return bindings, nil
+}
+
+// podmanHostPort picks a concrete port from a published range because Podman's
+// compat API rejects range values. Docker allocates the first free port in the
+// range; matching that needs engine state, so use the replica index instead.
+// shortcut: replica-index assignment, switch to engine allocation when Podman
+// supports port ranges.
+func podmanHostPort(published string, number int) (string, error) {
+	first, last, ok := strings.Cut(published, "-")
+	if !ok {
+		return published, nil
+	}
+	firstPort, err := strconv.Atoi(first)
+	if err != nil {
+		return "", err
+	}
+	lastPort, err := strconv.Atoi(last)
+	if err != nil {
+		return "", err
+	}
+	port := firstPort + max(number, 1) - 1
+	if port > lastPort {
+		return "", fmt.Errorf("published port range %q is too small for %d replicas", published, number)
+	}
+	return strconv.Itoa(port), nil
 }
 
 func getDependentServiceFromMode(mode string) string {
@@ -1228,6 +1271,12 @@ func fillBindMounts(project types.Project, service types.ServiceConfig, mounts m
 			return nil, err
 		}
 		mounts[bindMount.Target] = bindMount
+	}
+
+	if isPodman() {
+		// Secrets/configs are appended as bind strings with `:z` instead of
+		// structured mounts; see podmanFileReferenceBinds.
+		return mounts, nil
 	}
 
 	secretMounts, err := buildContainerSecretMounts(project, service)
