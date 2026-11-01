@@ -16,7 +16,8 @@ mkdir -p /etc/containers/containers.conf.d /root/.docker
 # No journald inside the CI container: force the file log driver.
 printf '[containers]\nlog_driver = "k8s-file"\n' > /etc/containers/containers.conf.d/99-podman-e2e.conf
 # overlay is much faster than vfs; fall back if nested overlay is unsupported.
-printf '[storage]\ndriver = "overlay"\nrunroot = "/run/containers/storage"\ngraphroot = "/var/lib/containers/storage"\n' > /etc/containers/storage.conf
+driver="${STORAGE_DRIVER:-overlay}"
+printf '[storage]\ndriver = "%s"\nrunroot = "/run/containers/storage"\ngraphroot = "/var/lib/containers/storage"\n' "$driver" > /etc/containers/storage.conf
 if ! podman info >/dev/null 2>&1; then
   printf '[storage]\ndriver = "vfs"\nrunroot = "/run/containers/storage"\ngraphroot = "/var/lib/containers/storage"\n' > /etc/containers/storage.conf
 fi
@@ -40,6 +41,10 @@ fi
 
 export DOCKER_HOST=unix:///run/podman/podman.sock
 export COMPOSE_E2E_BIN_PATH="${E2E_BIN:?E2E_BIN must point at the built compose binary}"
+
+# buildah mounts an overlay for the build context; on Fedora 45 the container's
+# overlay root rejects that, while a tmpfs works.
+mount -t tmpfs tmpfs /var/tmp 2>/dev/null || true
 
 # Classic-build smoke check (H2), independent of the suite.
 workdir=$(mktemp -d)
