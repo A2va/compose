@@ -395,7 +395,7 @@ func (s *composeService) getCreateConfigs(ctx context.Context,
 	}
 
 	// NETWORKING
-	links, err := s.getLinks(ctx, p.Name, service, number)
+	links, err := s.containerLinks(ctx, p.Name, service, number)
 	if err != nil {
 		return createConfigs{}, err
 	}
@@ -524,7 +524,7 @@ func (s *composeService) prepareContainerMACAddress(service types.ServiceConfig,
 	return nil
 }
 
-func getAliases(project *types.Project, service types.ServiceConfig, serviceIndex int, cfg *types.ServiceNetworkConfig, useNetworkAliases bool) []string {
+func getAliases(project *types.Project, service types.ServiceConfig, serviceIndex int, networkKey string, cfg *types.ServiceNetworkConfig, useNetworkAliases bool) []string {
 	aliases := []string{naming.ContainerName(project.Name, service, serviceIndex)}
 	if useNetworkAliases {
 		if cfg.ServiceNameAliasEnabled() {
@@ -533,6 +533,9 @@ func getAliases(project *types.Project, service types.ServiceConfig, serviceInde
 		if cfg != nil {
 			aliases = append(aliases, cfg.Aliases...)
 		}
+	}
+	if isPodman() {
+		aliases = append(aliases, podmanLinkAliases(project, service, networkKey)...)
 	}
 	return aliases
 }
@@ -567,7 +570,7 @@ func createEndpointSettings(p *types.Project, service types.ServiceConfig, servi
 	}
 
 	return &network.EndpointSettings{
-		Aliases:     getAliases(p, service, serviceIndex, config, useNetworkAliases),
+		Aliases:     getAliases(p, service, serviceIndex, networkKey, config, useNetworkAliases),
 		Links:       links,
 		IPAddress:   ipv4Address,
 		IPv6Gateway: ipv6Address,

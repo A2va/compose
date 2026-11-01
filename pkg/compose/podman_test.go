@@ -154,6 +154,28 @@ func TestCreateTarUsesRelativeTarget(t *testing.T) {
 	assert.Equal(t, header.Name, "run/secrets/bar")
 }
 
+func TestPodmanLinkAliases(t *testing.T) {
+	project := &types.Project{
+		Name: "test",
+		Services: types.Services{
+			"web": {
+				Name:  "web",
+				Links: []string{"db:database", "cache"},
+			},
+			"db": {Name: "db"},
+			"cache": {
+				Name: "cache",
+				ContainerSpec: types.ContainerSpec{
+					Networks: map[string]*types.ServiceNetworkConfig{"back": nil},
+				},
+			},
+		},
+	}
+	assert.DeepEqual(t, podmanLinkAliases(project, project.Services["db"], "default"), []string{"database"})
+	assert.DeepEqual(t, podmanLinkAliases(project, project.Services["cache"], "back"), []string(nil))
+	assert.DeepEqual(t, podmanLinkAliases(project, project.Services["cache"], "default"), []string(nil))
+}
+
 func TestPodmanFileReferenceFile(t *testing.T) {
 	path, err := podmanFileReferenceFile("project", secretMount, "token", "s3cr3t")
 	assert.NilError(t, err)
