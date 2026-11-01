@@ -144,6 +144,23 @@ func (s *composeService) doBuildImage(ctx context.Context, project *types.Projec
 	service.Build.Labels[api.ImageBuilderLabel] = "classic"
 
 	dockerfileName := dockerFilePath(service.Build.Context, service.Build.Dockerfile)
+	if service.Build.DockerfileInline != "" {
+		// The classic builder reads the Dockerfile from disk; materialize the
+		// inline one. It is outside the context, so it is streamed in instead.
+		inline, err := os.CreateTemp("", "compose-inline-Dockerfile-")
+		if err != nil {
+			return "", err
+		}
+		if _, err := inline.WriteString(service.Build.DockerfileInline); err != nil {
+			_ = inline.Close()
+			return "", err
+		}
+		if err := inline.Close(); err != nil {
+			return "", err
+		}
+		defer func() { _ = os.Remove(inline.Name()) }()
+		dockerfileName = inline.Name()
+	}
 	specifiedContext := service.Build.Context
 	progBuff := s.stdout()
 	buildBuff := s.stdout()

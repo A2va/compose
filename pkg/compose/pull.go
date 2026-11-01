@@ -384,6 +384,11 @@ func ImageDigestResolver(ctx context.Context, file *configfile.ConfigFile, apiCl
 
 func imageDigestResolver(ctx context.Context, credentials registry.AuthProvider, apiClient client.APIClient) func(named reference.Named) (digest.Digest, error) {
 	return func(named reference.Named) (digest.Digest, error) {
+		if isPodman() {
+			// Podman's compat API does not implement Docker's /distribution
+			// endpoint, so resolve the index digest against the registry.
+			return registryRemoteDigest(ctx, named, credentials)
+		}
 		auth, err := registry.EncodedAuth(named, credentials)
 		if err != nil {
 			return "", err
