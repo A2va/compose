@@ -422,9 +422,8 @@ func (s *composeService) getCreateConfigs(ctx context.Context,
 			Type:   service.Logging.Driver,
 			Config: service.Logging.Options,
 		}
-		if isPodman() && logConfig.Type == "json-file" {
-			// Podman has no json-file driver; k8s-file is its local JSON log format.
-			logConfig.Type = "k8s-file"
+		if isPodman() {
+			logConfig.Type = podmanLogDriver(logConfig.Type)
 		}
 	}
 	securityOpts, unconfined, err := parseSecurityOpts(p, service.SecurityOpt)

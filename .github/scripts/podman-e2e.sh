@@ -48,7 +48,8 @@ printf 'hi\n' > "$workdir/hello"
 printf 'services:\n  app:\n    build: .\n    image: localhost/compose-podman-ci:test\n' > "$workdir/compose.yaml"
 (cd "$workdir" && "$E2E_BIN" -p podman-ci build >/dev/null)
 
-# Known Podman engine gap excluded: Docker-only log drivers (TestLoggingDriver).
+# TestLoggingDriver needs a real Docker CLI for its Desktop probe; the CI
+# images only provide podman-docker, whose `docker info -f` lacks that field.
 cd pkg/e2e
 ../../bin/e2e.test -test.v -test.count=1 -test.parallel 4 -test.timeout 25m \
   -test.run 'TestUpNoDeps$|TestPs$|TestCopy$|TestExec$|TestStartStop$|TestEventsUnknownService$|TestNetworks$|TestUpWait$|TestLocalComposeLogs$|TestPortRange$|TestSecretFromInclude$|TestComposePull$|TestNetworkAliases$|TestNetworkLinks$|TestSecretFromEnv$|TestLocalComposeExec$|TestLocalComposeExecOneOff$|TestPause$|TestPauseServiceAlreadyPaused$|TestConfigFromEnv$|TestUnsetEnv$|TestUpDryRunMissingImage$|TestWatchSyncIntoSymlinkedDirectory$|TestCascadeStop$|TestCascadeFail$|TestCascadeIgnoresOneOffContainer$|TestExposeRange$|TestInitContainer$|TestCompatibility$|TestConfig$|TestMacAddress$|TestNetworkModes$|TestPostStartHookSuccess$|TestPreStartHookSuccess$|TestPreStopHookSuccess$|TestRestart$|TestStartStopWithDependencies$|TestUpDependenciesNotStopped$'

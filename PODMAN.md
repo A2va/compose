@@ -9,9 +9,9 @@ defaulting, classic-build forcing, registry digest fallback, e2e `DOCKER_HOST`
 support, link emulation, secret ownership, the P1 compat shims (port ranges,
 `json-file`, `dockerfile_inline`, secrets/configs), build-arg image identity,
 watch sync into existing paths, one-off/log-attach races, default-bridge link
-injection and a CI matrix that runs the e2e suite against Podman 4.3
-(Debian 12), 4.9 (Ubuntu 24.04) and current Fedora. Known Podman gaps are
-listed below.
+injection, log-driver fallback and a CI matrix that runs the e2e suite against
+Podman 4.3 (Debian 12), 4.9 (Ubuntu 24.04) and current Fedora. Known Podman
+gaps are listed below.
 
 ## Goal
 
@@ -123,8 +123,9 @@ All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`,
 These are engine limitations, not missing compose features:
 
 - **Docker-only log drivers** (e.g. `fluentd`) — Podman supports
-  `k8s-file`/`journald`/`none`/`passthrough`; `json-file` is mapped to
-  `k8s-file`.
+  `k8s-file`/`journald`/`none`/`passthrough`; `json-file` and any other
+  unsupported driver fall back to `k8s-file` with a warning, so logs stay
+  local instead of reaching the configured sink.
 - **BuildKit-only build features** (multi-arch, build secrets, ssh,
   additional contexts, builder selection) — classic builder limitation;
   upstream already prints a clear error. Podman builds with buildah.
@@ -173,10 +174,11 @@ systemd and local runs can be rootless):
 Whole suite, serial, with `TMPDIR` under `/tmp/opencode`:
 
 `go test -tags e2e ./pkg/e2e -parallel 1` → **186 pass / 42 fail / 11 skip**
-before the default-bridge link injection; that fix makes `TestNetworkLinks`
-pass, so the expected baseline is **187 pass / 41 fail / 11 skip**.
-The skips are optional Docker Desktop, model/buildx and multi-platform cases.
-Every remaining failure falls into the categories above:
+before the default-bridge link injection and log-driver fallback; those fixes
+make `TestNetworkLinks` and `TestLoggingDriver` pass, so the expected baseline
+is **188 pass / 40 fail / 11 skip**. The skips are optional Docker Desktop,
+model/buildx and multi-platform cases. Every remaining failure falls into the
+categories above:
 
 - BuildKit/buildx/build-log: `TestBuild*`, `TestComposeRunBuild`,
   `TestRunBuildOnce{Dependency,NestedDependencies,NoDeps}`.
@@ -185,7 +187,7 @@ Every remaining failure falls into the categories above:
   `TestConvertAndTransformList`, `TestConvertBuildOnlyService`.
 - Engine behavior: `TestIPAMConfig`, `TestLocalComposeLogsFollow`,
   `TestNoDepsNetworkMode`, `TestUpAttachedTerminatesOnExternalStop`,
-  `TestRebuildOnDotEnvWithExternalNetwork`, `TestLoggingDriver`.
+  `TestRebuildOnDotEnvWithExternalNetwork`.
 - Environment on this host: `TestLocalComposeUp` (no systemd),
   `TestNetworkConfigChanged` (host subnet), `TestLocalComposeVolume`
   (SELinux mode field), `TestComposeRun`/`TestLocalComposeLargeLogs`/
@@ -251,7 +253,9 @@ skips with the reasons recorded here.
   pull/port-range/secrets/links, plus watch sync, cascades (including a
   concurrent one-off), expose ranges, hooks, restart and network modes) and a
   classic-build smoke on every Podman version. Known gaps above are excluded
-  by design.
+  by design. The log-driver fallback is exercised on a host with a real Docker
+  CLI: `TestLoggingDriver` probes `docker info -f {{.OperatingSystem}}`, which
+  podman-docker's wrapper does not implement.
 - **Local runs** use the same script:
   `CGO_ENABLED=0 make build GO_BUILDTAGS="e2e standalone" && CGO_ENABLED=0 go
   test -c -tags "e2e standalone" -o bin/e2e.test ./pkg/e2e` then
@@ -274,9 +278,9 @@ skips with the reasons recorded here.
   24.04) and current Fedora, with a classic-build smoke on each version.
 - **P3 (implemented)** — close the compose-side gaps found by the suite:
   build-arg image identity despite buildah's cache, watch sync into existing
-  paths, one-off event filtering, log attach to already-removed containers and
-  default-bridge link injection; widen the CI subset with the tests this
-  unlocked.
+  paths, one-off event filtering, log attach to already-removed containers,
+  default-bridge link injection and unsupported log-driver fallback; widen the
+  CI subset with the tests this unlocked.
 - **P4** (optional) — Podman niceties: rootless hints in errors, socket
   auto-activation check, `podman build` shell-out for multi-arch if ever
   needed.
