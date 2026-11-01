@@ -387,11 +387,9 @@ func (s *composeService) getCreateConfigs(ctx context.Context,
 		return createConfigs{}, err
 	}
 	if isPodman() {
-		fileBinds, err := podmanFileReferenceBinds(*p, service)
-		if err != nil {
-			return createConfigs{}, err
-		}
-		binds = append(binds, fileBinds...)
+		// Secrets/configs are injected through /run/secrets, which Podman
+		// backs with a tmpfs: archive copies only reach it through a volume.
+		mounts = append(mounts, podmanSecretVolume(service, mounts)...)
 	}
 
 	// NETWORKING

@@ -18,11 +18,13 @@ package compose
 
 import (
 	"archive/tar"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/moby/moby/api/types/mount"
 	"gotest.tools/v3/assert"
 )
 
@@ -146,12 +148,35 @@ func TestPodmanHostPort(t *testing.T) {
 	assert.ErrorContains(t, err, "too small")
 }
 
-func TestCreateTarUsesRelativeTarget(t *testing.T) {
-	b, err := createTar("hello", types.FileReferenceConfig{Target: "/run/secrets/bar"})
+func TestCreateTarIncludesParentsAndOwnership(t *testing.T) {
+	mode := types.FileMode(0o440)
+	b, err := createTar("hello", types.FileReferenceConfig{
+		Target: "/run/secrets/bar",
+		Mode:   &mode,
+		UID:    "1005",
+		GID:    "1005",
+	})
 	assert.NilError(t, err)
-	header, err := tar.NewReader(&b).Next()
-	assert.NilError(t, err)
-	assert.Equal(t, header.Name, "run/secrets/bar")
+
+	var names []string
+	var file *tar.Header
+	reader := tar.NewReader(&b)
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		assert.NilError(t, err)
+		names = append(names, header.Name)
+		if header.Name == "run/secrets/bar" {
+			file = header
+		}
+	}
+	assert.DeepEqual(t, names, []string{"run/", "run/secrets/", "run/secrets/bar"})
+	assert.Assert(t, file != nil)
+	assert.Equal(t, file.Uid, 1005)
+	assert.Equal(t, file.Gid, 1005)
+	assert.Equal(t, file.Mode, int64(0o440))
 }
 
 func TestPodmanLinkAliases(t *testing.T) {
@@ -176,13 +201,20 @@ func TestPodmanLinkAliases(t *testing.T) {
 	assert.DeepEqual(t, podmanLinkAliases(project, project.Services["cache"], "default"), []string(nil))
 }
 
-func TestPodmanFileReferenceFile(t *testing.T) {
-	path, err := podmanFileReferenceFile("project", secretMount, "token", "s3cr3t")
-	assert.NilError(t, err)
-	content, err := os.ReadFile(path)
-	assert.NilError(t, err)
-	assert.Equal(t, string(content), "s3cr3t")
-	info, err := os.Stat(path)
-	assert.NilError(t, err)
-	assert.Equal(t, info.Mode().Perm(), os.FileMode(0o644))
+func TestPodmanSecretVolume(t *testing.T) {
+	service := types.ServiceConfig{ContainerSpec: types.ContainerSpec{
+		Secrets: []types.ServiceSecretConfig{{Source: "token"}},
+	}}
+	mounts := podmanSecretVolume(service, nil)
+	assert.Equal(t, len(mounts), 1)
+	assert.Equal(t, string(mounts[0].Type), "volume")
+	assert.Equal(t, mounts[0].Target, "/run/secrets")
+
+	absolute := types.ServiceConfig{ContainerSpec: types.ContainerSpec{
+		Secrets: []types.ServiceSecretConfig{{Source: "token", Target: "/etc/token"}},
+	}}
+	assert.Equal(t, len(podmanSecretVolume(absolute, nil)), 0)
+
+	// A user-provided mount at /run/secrets takes precedence.
+	assert.Equal(t, len(podmanSecretVolume(service, []mount.Mount{{Target: "/run/secrets"}})), 0)
 }
