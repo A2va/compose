@@ -526,6 +526,9 @@ func (u *upSession) stopOnFirstExit() api.ContainerEventListener {
 		if !once {
 			return
 		}
+		if event.Container != nil && isOneOff(event.Container.Labels) {
+			return
+		}
 		if event.Type != api.ContainerEventExited {
 			return
 		}
@@ -642,6 +645,11 @@ func (u *upSession) streamContainerLogs(turn *logTurn, event api.ContainerEvent,
 		return err
 	}
 	ctr, err := u.inspectWithSlot(u.globalCtx, u.logOpenLimiter, event.ID)
+	if errdefs.IsNotFound(err) {
+		// A one-off or fast-exiting container can be removed before we open
+		// its logs; there is nothing left to relay.
+		return nil
+	}
 	if err != nil {
 		return err
 	}

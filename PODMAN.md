@@ -8,9 +8,9 @@ Status (2026-11-01): P0, P1, P2 and P3 implemented — engine detection, socket
 defaulting, classic-build forcing, registry digest fallback, e2e `DOCKER_HOST`
 support, link emulation, secret ownership, the P1 compat shims (port ranges,
 `json-file`, `dockerfile_inline`, secrets/configs), build-arg image identity,
-watch sync into existing paths and a CI matrix that runs the e2e suite against
-Podman 4.3 (Debian 12), 4.9 (Ubuntu 24.04) and current Fedora. Known Podman
-gaps are listed below.
+watch sync into existing paths, one-off/log-attach races and a CI matrix that
+runs the e2e suite against Podman 4.3 (Debian 12), 4.9 (Ubuntu 24.04) and
+current Fedora. Known Podman gaps are listed below.
 
 ## Goal
 
@@ -96,6 +96,8 @@ binary, `pkg/compose/build_bake.go:182`).
 | `pkg/compose/pull.go` | If Podman, resolve image digests via `registry.RemoteDigest` (`internal/registry/remote.go`) because Podman has no `GET /distribution/{name}/json`. |
 | `pkg/compose/secrets.go` | Tar entries use relative names and include parent directories, and Podman skips `copyUIDGID` so the declared uid/gid/mode survive extraction. |
 | `pkg/compose/ps.go` | Podman <1.44 omits EXPOSE'd ports from `/containers/json` and the host IP from published ports; restore both for `compose ps`/`port`. |
+| `pkg/compose/monitor.go` | Filter one-off containers from the initial set and the event loop: Podman does not always apply the event stream's one-off label filter, which made a `compose run` exit abort an attached `up`. |
+| `pkg/compose/up.go`, `pkg/compose/logs.go` | Treat a container removed between its start event and log attach as already finished instead of failing `up`/`logs --follow`. |
 | `internal/sync/tar.go` | Retry without implied directory headers when the engine reports `file exists` (Podman's copier), in addition to Docker's symlink error. |
 | `pkg/e2e/framework.go` | Pass `DOCKER_HOST` through to e2e commands, like `DOCKER_CONTEXT`, and copy the host `config.json` into the per-test config dir (the upstream check was inverted, which breaks podman-docker's CLI wrapper). |
 
@@ -123,8 +125,9 @@ These are engine limitations, not missing compose features:
 - **BuildKit-only build features** (multi-arch, build secrets, ssh,
   additional contexts, builder selection) — classic builder limitation;
   upstream already prints a clear error. Podman builds with buildah.
-- **Build log format** — tests asserting Docker's classic "naming to … done"
-  output do not match buildah's output, although the build succeeds.
+- **Build log and error text** — tests asserting Docker's classic
+  "naming to … done" output or `No such image: …` wording do not match
+  buildah's output, although the build succeeds.
 - **Legacy `links` on the default bridge** — Podman's default bridge has no
   DNS or alias support, so link aliases only work on user-defined networks.
 - **Static network address metadata** — the address is assigned, but Podman
@@ -138,8 +141,6 @@ These are engine limitations, not missing compose features:
   other containers share a netns with, where Docker force-removes.
 - **Restart backoff state** — Podman does not expose Docker's
   `State.Restarting` backoff to clients.
-- **One-off removal race** — Podman reaps `run --rm` containers fast enough
-  that a concurrent monitor can observe a missing container.
 - **Inspect network mode** — Podman reports `HostConfig.NetworkMode` as
   `bridge` for containers attached to an external network.
 - **Swarm features, `compose alpha` provider/relay/bridge, Docker Desktop** —
@@ -161,13 +162,16 @@ systemd and local runs can be rootless):
 - **Logs-follow cold start** — `TestLocalComposeLogsFollow` gives the first
   stream 1s to produce a line; Podman can take longer on a loaded host. The
   follow itself, including replicas created later, works.
+- **Rootless host file permissions** — `TestLocalComposeLargeLogs` bind-mounts
+  a 0600 temp file the rootless container user cannot read.
 
 ### Full-suite baseline (Podman 5.8.9 rootless, 2026-11-01)
 
-`go test -tags e2e ./pkg/e2e` → **183 pass / 47 fail / 9 skip**; the two
-compose-side fixes below now make `TestScaleDownNoRecreate` and
-`TestWatchSyncIntoSymlinkedDirectory` pass. Every remaining failure falls into
-the categories above:
+`go test -tags e2e ./pkg/e2e` → **183 pass / 47 fail / 9 skip** at the time
+of this snapshot. The compose-side fixes now also make
+`TestScaleDownNoRecreate`, `TestWatchSyncIntoSymlinkedDirectory`,
+`TestCascadeIgnoresOneOffContainer` and `TestExposeRange` pass. Every remaining
+failure falls into the categories above:
 
 - BuildKit/buildx/build-log: `TestBuild*`, `TestComposeRunBuild`,
   `TestRunBuildOnce{Dependency,NestedDependencies,NoDeps}`.
@@ -177,13 +181,13 @@ the categories above:
 - Engine behavior: `TestIPAMConfig`, `TestLocalComposeLogsFollow`,
   `TestNetworkLinks`, `TestNoDepsNetworkMode`,
   `TestUpAttachedTerminatesOnExternalStop`,
-  `TestCascadeIgnoresOneOffContainer`, `TestRebuildOnDotEnvWithExternalNetwork`,
-  `TestAttachRestart`, `TestLoggingDriver`.
+  `TestRebuildOnDotEnvWithExternalNetwork`, `TestAttachRestart`,
+  `TestLoggingDriver`.
 - Environment/flaky on this host: `TestLocalComposeUp` (no systemd),
   `TestUpStopWithLogsMixed`/`TestWatchExec` (rootless ping),
   `TestWatchMultiServices` (watch timing), `TestNetworkConfigChanged`
   (host subnet), `TestLocalComposeVolume` (SELinux mode field),
-  `TestExposeRange` (passes when rerun).
+  `TestLocalComposeLargeLogs` (rootless file permissions).
 
 The CI script runs the passing Podman-relevant subset; expanding it to the
 whole suite requires either fixing the engine gaps above or marking these as
@@ -242,9 +246,10 @@ skips with the reasons recorded here.
 - **E2E against Podman**: the CI script
   `.github/scripts/podman-e2e.sh` builds a static test binary and runs the
   validated subset (up/ps/copy/exec/logs/start/stop/events/networks/wait/
-  pull/port-range/secrets/links, plus watch sync, cascades, hooks, restart
-  and network modes) and a classic-build smoke on every Podman version.
-  Known gaps above are excluded by design.
+  pull/port-range/secrets/links, plus watch sync, cascades (including a
+  concurrent one-off), expose ranges, hooks, restart and network modes) and a
+  classic-build smoke on every Podman version. Known gaps above are excluded
+  by design.
 - **Local runs** use the same script:
   `CGO_ENABLED=0 make build GO_BUILDTAGS="e2e standalone" && CGO_ENABLED=0 go
   test -c -tags "e2e standalone" -o bin/e2e.test ./pkg/e2e` then
@@ -265,9 +270,10 @@ skips with the reasons recorded here.
   matrix green except the documented engine gaps.
 - **P2 (implemented)** — CI matrix for Podman 4.3 (Debian 12), 4.9 (Ubuntu
   24.04) and current Fedora, with a classic-build smoke on each version.
-- **P3 (implemented)** — close the remaining compose-side gaps found by the
-  suite: build-arg image identity despite buildah's cache and watch sync into
-  existing paths; widen the CI subset with the tests this unlocked.
+- **P3 (implemented)** — close the compose-side gaps found by the suite:
+  build-arg image identity despite buildah's cache, watch sync into existing
+  paths, one-off event filtering and log attach to already-removed containers;
+  widen the CI subset with the tests this unlocked.
 - **P4** (optional) — Podman niceties: rootless hints in errors, socket
   auto-activation check, `podman build` shell-out for multi-arch if ever
   needed.
