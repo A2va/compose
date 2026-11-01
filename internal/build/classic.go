@@ -43,6 +43,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/docker/compose/v5/internal/depgraph"
+	"github.com/docker/compose/v5/internal/engine"
 	composeprogress "github.com/docker/compose/v5/internal/progress"
 	"github.com/docker/compose/v5/pkg/api"
 )
@@ -148,19 +149,12 @@ func (s *Service) doBuildImage(ctx context.Context, project *types.Project, serv
 	if service.Build.DockerfileInline != "" {
 		// The classic builder reads the Dockerfile from disk; materialize the
 		// inline one. It is outside the context, so it is streamed in instead.
-		inline, err := os.CreateTemp("", "compose-inline-Dockerfile-")
+		name, cleanup, err := classicInlineDockerfile(project, service)
 		if err != nil {
 			return "", err
 		}
-		if _, err := inline.WriteString(service.Build.DockerfileInline); err != nil {
-			_ = inline.Close()
-			return "", err
-		}
-		if err := inline.Close(); err != nil {
-			return "", err
-		}
-		defer func() { _ = os.Remove(inline.Name()) }()
-		dockerfileName = inline.Name()
+		defer cleanup()
+		dockerfileName = name
 	}
 	specifiedContext := service.Build.Context
 	progBuff := s.backend.CLI().Out()
@@ -171,6 +165,11 @@ func (s *Service) doBuildImage(ctx context.Context, project *types.Project, serv
 		return "", err
 	}
 	defer bctx.cleanup()
+
+	composeLabels, err := s.classicBuildLabels(project, service, bctx)
+	if err != nil {
+		return "", err
+	}
 
 	buildCtx := bctx.buildCtx
 	relDockerfile := bctx.relDockerfile
@@ -203,7 +202,7 @@ func (s *Service) doBuildImage(ctx context.Context, project *types.Project, serv
 	if err != nil {
 		return "", err
 	}
-	buildOpts := imageBuildOptions(s.backend.ProxyConfig(), project, service, options)
+	buildOpts := imageBuildOptions(s.backend.ProxyConfig(), project, service, options, composeLabels)
 	imageName := api.GetImageNameOrDefault(service, project.Name)
 	buildOpts.Tags = append(buildOpts.Tags, imageName)
 	buildOpts.Dockerfile = relDockerfile
@@ -242,7 +241,68 @@ func (s *Service) doBuildImage(ctx context.Context, project *types.Project, serv
 		return "", err
 	}
 	s.backend.Events().On(composeprogress.Built(imageName))
+	if engine.IsPodman() {
+		// buildah reports the tag as "Successfully tagged …"; the Docker classic
+		// builder's "naming to … done" line is what scripts and progress
+		// parsers expect, so emit it for parity.
+		_, _ = fmt.Fprintf(buildBuff, "naming to %s done\n", imageName)
+	}
 	return imageID, nil
+}
+
+// classicDockerfileContent returns the Dockerfile the classic builder will
+// read from a local or cloned context. Remote contexts stream their archive
+// and have no local Dockerfile to rewrite.
+func classicDockerfileContent(bctx *classicBuildContext) (string, bool, error) {
+	if bctx.dockerfileCtx != nil {
+		content, err := io.ReadAll(bctx.dockerfileCtx)
+		if err != nil {
+			return "", false, err
+		}
+		return string(content), true, nil
+	}
+	if bctx.contextDir == "" {
+		return "", false, nil
+	}
+	content, err := os.ReadFile(filepath.Join(bctx.contextDir, bctx.relDockerfile))
+	if err != nil {
+		return "", false, err
+	}
+	return string(content), true, nil
+}
+
+func podmanInjectDockerfileLabels(project *types.Project, service types.ServiceConfig, bctx *classicBuildContext) (bool, error) {
+	content, found, err := classicDockerfileContent(bctx)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+	rewritten := podmanDockerfileWithLabels(content, podmanDockerfileLabels(project, service), service.Build.Target)
+	bctx.dockerfileCtx = io.NopCloser(strings.NewReader(rewritten))
+	return true, nil
+}
+
+// classicInlineDockerfile materializes an inline Dockerfile, resolving named
+// service build contexts to the images the classic builder produces for them.
+func classicInlineDockerfile(project *types.Project, service types.ServiceConfig) (string, func(), error) {
+	dockerfile := service.Build.DockerfileInline
+	if engine.IsPodman() {
+		dockerfile = podmanRewriteServiceContexts(dockerfile, podmanResolveServiceContexts(project, service))
+	}
+	inline, err := os.CreateTemp("", "compose-inline-Dockerfile-")
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := inline.WriteString(dockerfile); err != nil {
+		_ = inline.Close()
+		return "", nil, err
+	}
+	if err := inline.Close(); err != nil {
+		return "", nil, err
+	}
+	return inline.Name(), func() { _ = os.Remove(inline.Name()) }, nil
 }
 
 // checkClassicBuilderSupported rejects build options the classic builder
@@ -254,7 +314,8 @@ func checkClassicBuilderSupported(service types.ServiceConfig) error {
 	if service.Build.Privileged {
 		return errors.New("the classic builder doesn't support privileged mode; building with BuildKit requires the buildx Docker CLI plugin, and DOCKER_BUILDKIT must not be set to 0")
 	}
-	if len(service.Build.AdditionalContexts) > 0 {
+	if len(service.Build.AdditionalContexts) > 0 &&
+		(!engine.IsPodman() || service.Build.DockerfileInline == "" || !podmanServiceContextsOnly(service.Build.AdditionalContexts)) {
 		return errors.New("the classic builder doesn't support additional contexts; building with BuildKit requires the buildx Docker CLI plugin, and DOCKER_BUILDKIT must not be set to 0")
 	}
 	if len(service.Build.SSH) > 0 {
@@ -358,16 +419,46 @@ func (s *Service) classicAuthConfigs() (map[string]registry.AuthConfig, error) {
 	return authConfigs, nil
 }
 
-func imageBuildOptions(proxyConfigs map[string]*string, project *types.Project, service types.ServiceConfig, options api.BuildOptions) client.ImageBuildOptions {
+// classicBuildLabels reports whether the standard Compose labels go through
+// the build request. Podman gets them as Dockerfile instructions instead:
+// buildah turns request labels into image steps in Go map order, so their
+// changing order would change the image ID on every rebuild.
+func (s *Service) classicBuildLabels(project *types.Project, service types.ServiceConfig, bctx *classicBuildContext) (bool, error) {
+	if !engine.IsPodman() {
+		return true, nil
+	}
+	injected, err := podmanInjectDockerfileLabels(project, service, bctx)
+	if err != nil {
+		return false, err
+	}
+	if injected {
+		return false, nil
+	}
+	// A remote context's Dockerfile is not on disk; fall back to the
+	// build-request labels.
+	return true, nil
+}
+
+func imageBuildOptions(proxyConfigs map[string]*string, project *types.Project, service types.ServiceConfig, options api.BuildOptions, composeLabels bool) client.ImageBuildOptions {
 	config := service.Build
+	buildArgs := resolveAndMergeBuildArgs(proxyConfigs, project, service, options)
+	labels := config.Labels
+	if composeLabels {
+		// The classic builder must tag its images with the project/service
+		// labels, or `down --rmi local` cannot tell which of them Compose built.
+		labels = getImageBuildLabels(project, service)
+	}
+	if engine.IsPodman() && len(buildArgs) > 0 {
+		labels = withPodmanBuildArgsLabel(labels, buildArgs)
+	}
 	return client.ImageBuildOptions{
 		Version:     buildtypes.BuilderV1,
 		Tags:        config.Tags,
 		NoCache:     config.NoCache,
 		Remove:      true,
 		PullParent:  config.Pull,
-		BuildArgs:   resolveAndMergeBuildArgs(proxyConfigs, project, service, options),
-		Labels:      config.Labels,
+		BuildArgs:   buildArgs,
+		Labels:      labels,
 		NetworkMode: config.Network,
 		ExtraHosts:  config.ExtraHosts.AsList(":"),
 		Target:      config.Target,

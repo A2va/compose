@@ -53,6 +53,7 @@ import (
 	"github.com/tonistiigi/go-csvvalue"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/docker/compose/v5/internal/engine"
 	"github.com/docker/compose/v5/internal/progress"
 	"github.com/docker/compose/v5/pkg/api"
 )
@@ -64,7 +65,7 @@ const buildxMinVersion = "0.17.0"
 const buildxJobsMinVersion = "0.38.0"
 
 func buildWithBake(dockerCli command.Cli) (bool, error) {
-	if isPodman() {
+	if engine.IsPodman() {
 		// Podman's compat API serves no /grpc and /session endpoints, so bake
 		// cannot work there; Podman's classic /build endpoint runs buildah.
 		return false, nil

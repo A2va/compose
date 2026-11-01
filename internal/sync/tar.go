@@ -116,17 +116,20 @@ func (t *Tar) Sync(ctx context.Context, service string, paths []*PathMapping) er
 
 			if err := t.client.Untar(ctx, containerID, tarReader); err != nil {
 				// The engine answers with a plain 500, so the message is the only discriminator.
-				if !strings.Contains(err.Error(), "cannot overwrite non-directory") {
+				// Docker rejects a directory header through a symlink; Podman's copier instead
+				// tries to mkdir a directory the container already has and reports "file exists".
+				if !strings.Contains(err.Error(), "cannot overwrite non-directory") &&
+					!strings.Contains(err.Error(), "file exists") {
 					errMu.Lock()
 					errs = append(errs, fmt.Errorf("copying files to %s: %w", containerID, err))
 					errMu.Unlock()
 					return nil
 				}
 
-				// A directory header for a path the container resolves through a symlink makes
-				// the engine reject the whole copy, so retry without the headers the archive's
-				// own entries already imply. That archive is a strict subset of the one that
-				// just failed, so sending it again is safe.
+				// A directory header for a path the container resolves through a symlink (or
+				// already has) makes the engine reject the whole copy, so retry without the
+				// headers the archive's own entries already imply. That archive is a strict
+				// subset of the one that just failed, so sending it again is safe.
 				retry := tarArchive(pathsToCopy, dropImpliedDirectories)
 				if retryErr := t.client.Untar(ctx, containerID, retry); retryErr != nil {
 					errMu.Lock()

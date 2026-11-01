@@ -308,6 +308,32 @@ func TestSync_RetriesWithoutImpliedDirectoriesWhenCopyFails(t *testing.T) {
 	assert.Equal(t, retried["app/sub/nested/"].Typeflag, byte(tar.TypeDir), "an empty directory still needs its own header")
 }
 
+// Podman's copier tries to mkdir a directory the container already has (through a symlink, for
+// example) and reports "file exists"; the same retry without the implied directory headers works.
+func TestSync_RetriesWhenTheEngineReportsAnExistingDirectory(t *testing.T) {
+	tmpDir := populatedSyncDir(t)
+
+	client := &fakeLowLevelClient{
+		containers: []container.Summary{{ID: "ctr1"}},
+		untarErrs: []error{
+			errors.New(`copier: put: error creating "/app/sub": mkdir /app/sub: file exists`),
+		},
+	}
+	syncer := NewTar("proj", client, 0)
+
+	err := syncer.Sync(t.Context(), "svc", []*PathMapping{
+		{HostPath: filepath.Join(tmpDir, "sub"), ContainerPath: "/app/sub"},
+	})
+
+	assert.NilError(t, err)
+	assert.Equal(t, client.untarCount, 2)
+
+	retried := client.untarHeaders[1]
+	_, sentDirHeader := retried["app/sub/"]
+	assert.Check(t, !sentDirHeader, "no header expected for the directory holding the synced files: %v", retried)
+	assert.Equal(t, retried["app/sub/data.txt"].Typeflag, byte(tar.TypeReg))
+}
+
 func TestSync_ReportsTheCopyErrorWhenTheRetryFailsToo(t *testing.T) {
 	tmpDir := populatedSyncDir(t)
 
