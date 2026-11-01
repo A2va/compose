@@ -64,6 +64,11 @@ const buildxMinVersion = "0.17.0"
 const buildxJobsMinVersion = "0.38.0"
 
 func buildWithBake(dockerCli command.Cli) (bool, error) {
+	if isPodman() {
+		// Podman's compat API serves no /grpc and /session endpoints, so bake
+		// cannot work there; Podman's classic /build endpoint runs buildah.
+		return false, nil
+	}
 	enabled, err := dockerCli.BuildKitEnabled()
 	if err != nil {
 		return false, err

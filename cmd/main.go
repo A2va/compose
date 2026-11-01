@@ -17,6 +17,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	dockercli "github.com/docker/cli/cli"
@@ -83,6 +84,10 @@ func pluginMain() {
 }
 
 func main() {
+	if err := compose.ConfigurePodmanHost(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	if plugin.RunningStandalone() {
 		os.Args = append([]string{"docker"}, compatibility.Convert(os.Args[1:])...)
 	}
