@@ -28,6 +28,8 @@ import (
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/cli"
+
+	"github.com/docker/compose/v5/internal/engine"
 )
 
 // Podman support: compose talks to Podman through its Docker-compatible API
@@ -35,10 +37,6 @@ import (
 // the compatibility matrix and the overlay index.
 
 const containerEngineEnv = "COMPOSE_CONTAINER_ENGINE"
-
-// podmanProfile records that the engine was resolved to Podman at startup,
-// before docker/cli initializes its client.
-var podmanProfile bool
 
 // podmanConfigFiles are accepted as default compose file names in Podman mode.
 // They are appended after the standard names, so a project that has both keeps
@@ -106,7 +104,7 @@ func podmanInstalled() bool {
 }
 
 func enablePodman() {
-	podmanProfile = true
+	engine.SetPodmanProfile(true)
 	addPodmanConfigFiles()
 }
 
@@ -129,11 +127,11 @@ func defaultPodmanHost(required bool, args []string) error {
 	}
 	socket, err := podmanSocketPath(required)
 	if err != nil {
-		podmanProfile = false
+		engine.SetPodmanProfile(false)
 		return err
 	}
 	if socket == "" {
-		podmanProfile = false
+		engine.SetPodmanProfile(false)
 		if required {
 			return errors.New("no Podman socket found; " + podmanSocketHints)
 		}
@@ -205,9 +203,6 @@ func probePodmanSocket(path string) (bool, error) {
 	return true, nil
 }
 
-// isPodman reports whether this invocation targets Podman. `podman compose`
-// exports DOCKER_HOST pointing at the Podman socket, so the socket path also
-// serves as detection for invocations that skip our startup defaults.
 func isPodman() bool {
-	return podmanProfile || strings.Contains(os.Getenv("DOCKER_HOST"), "podman")
+	return engine.IsPodman()
 }
