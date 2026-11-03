@@ -15,6 +15,7 @@
 package compose
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -34,6 +35,7 @@ import (
 	"github.com/compose-spec/compose-go/v2/utils"
 	ccli "github.com/docker/cli/cli/command/container"
 	"github.com/moby/buildkit/util/progress/progressui"
+	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/image"
 	"github.com/moby/moby/client"
@@ -498,6 +500,49 @@ func (t tarDockerClient) Exec(ctx context.Context, containerID string, cmd []str
 		return errors.New("exit code " + strconv.Itoa(execResult.ExitCode))
 	}
 	return nil
+}
+
+// ResolvePath reports where path really is inside the container. Podman 6's
+// copier refuses to write through a symlink, so the caller syncs to the target
+// and leaves the link in place (docker/compose#13795).
+func (t tarDockerClient) ResolvePath(ctx context.Context, containerID string, containerPath string) (string, error) {
+	execCreateResp, err := t.s.apiClient().ExecCreate(ctx, containerID, client.ExecCreateOptions{
+		Cmd:          []string{"readlink", "-f", containerPath},
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	conn, err := t.s.apiClient().ExecAttach(ctx, execCreateResp.ID, client.ExecAttachOptions{TTY: false})
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	var out bytes.Buffer
+	var eg errgroup.Group
+	eg.Go(func() error {
+		_, err := stdcopy.StdCopy(&out, io.Discard, conn.Reader)
+		return err
+	})
+
+	if err := eg.Wait(); err != nil {
+		return "", err
+	}
+
+	res, err := t.s.apiClient().ExecInspect(ctx, execCreateResp.ID, client.ExecInspectOptions{})
+	if err != nil {
+		return "", err
+	}
+	if res.Running {
+		return "", errors.New("process still running")
+	}
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("readlink -f %s: exit code %d", containerPath, res.ExitCode)
+	}
+	return strings.TrimSpace(out.String()), nil
 }
 
 func (t tarDockerClient) Untar(ctx context.Context, id string, archive io.ReadCloser) error {
