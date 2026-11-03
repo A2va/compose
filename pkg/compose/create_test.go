@@ -401,7 +401,7 @@ func TestGetAliases(t *testing.T) {
 	service := composetypes.ServiceConfig{Name: "serviceName", ContainerName: "containerName"}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			aliases := getAliases(&composetypes.Project{Name: "projName"}, service, 0, tt.cfg, tt.useNetworkAliases)
+			aliases := getAliases(&composetypes.Project{Name: "projName"}, service, 0, "default", tt.cfg, tt.useNetworkAliases)
 			assert.DeepEqual(t, aliases, tt.expected)
 		})
 	}

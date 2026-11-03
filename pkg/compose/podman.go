@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/docker/compose/v5/internal/engine"
 )
 
 // Podman support: compose talks to Podman through its Docker-compatible API
@@ -31,10 +33,6 @@ import (
 // the compatibility matrix and the overlay index.
 
 const containerEngineEnv = "COMPOSE_CONTAINER_ENGINE"
-
-// podmanProfile records that the engine was resolved to Podman at startup,
-// before docker/cli initializes its client.
-var podmanProfile bool
 
 // rootfulPodmanSocket is a variable so tests can isolate from the host.
 var rootfulPodmanSocket = "/run/podman/podman.sock"
@@ -59,7 +57,7 @@ func configurePodmanHost(argv0 string, args []string) error {
 	case "docker":
 		return nil
 	case "podman":
-		podmanProfile = true
+		engine.SetPodmanProfile(true)
 		return defaultPodmanHost(true, args)
 	}
 	// A podman-compose binary defaults to the Podman socket; docker-compose
@@ -67,7 +65,7 @@ func configurePodmanHost(argv0 string, args []string) error {
 	if !strings.Contains(argv0, "podman") {
 		return nil
 	}
-	podmanProfile = true
+	engine.SetPodmanProfile(true)
 	return defaultPodmanHost(false, args)
 }
 
@@ -77,11 +75,11 @@ func defaultPodmanHost(required bool, args []string) error {
 	}
 	socket, err := podmanSocketPath()
 	if err != nil {
-		podmanProfile = false
+		engine.SetPodmanProfile(false)
 		return err
 	}
 	if socket == "" {
-		podmanProfile = false
+		engine.SetPodmanProfile(false)
 		if required {
 			return errors.New("no Podman socket found; " + podmanSocketHints)
 		}
@@ -146,9 +144,6 @@ func probePodmanSocket(path string) (bool, error) {
 	return true, nil
 }
 
-// isPodman reports whether this invocation targets Podman. `podman compose`
-// exports DOCKER_HOST pointing at the Podman socket, so the socket path also
-// serves as detection for invocations that skip our startup defaults.
 func isPodman() bool {
-	return podmanProfile || strings.Contains(os.Getenv("DOCKER_HOST"), "podman")
+	return engine.IsPodman()
 }
