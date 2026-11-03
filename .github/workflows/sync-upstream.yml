@@ -190,9 +190,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git push --force-with-lease="refs/heads/podman:${BASE}" origin "HEAD:refs/heads/podman"
-          git tag -f "podman-${TAG}" HEAD
-          git push --force origin "refs/tags/podman-${TAG}"
+          git tag -f "${TAG}" HEAD
+          git push --force origin "refs/tags/${TAG}"
           git push origin --delete "${BRANCH}" || true
 
       - name: Build and publish the release
-        run: gh workflow run ci.yml --ref "podman-${TAG}"
+        run: gh workflow run ci.yml --ref "${TAG}" -f release=true

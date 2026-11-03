@@ -105,7 +105,7 @@ binary, `pkg/compose/build_bake.go:182`).
 | `internal/sync/tar.go` | Retry without implied directory headers when the engine reports `file exists` (Podman's copier), in addition to Docker's symlink error; when Podman 6 still reports `path escapes from parent`, resolve the target and copy there. |
 | `pkg/compose/watch.go` | `ResolvePath` runs `readlink -f` in the container so sync can write through a symlink Podman 6 refuses to traverse. |
 | `pkg/e2e/framework.go` | Pass `DOCKER_HOST` through to e2e commands, like `DOCKER_CONTEXT`, and copy the host `config.json` into the per-test config dir (the upstream check was inverted, which breaks podman-docker's CLI wrapper). |
-| `.github/workflows/ci.yml` | Publish fork releases from `podman-v*` tags (non-draft) and skip upstream `v*` releases in the fork; its existing binary/SBOM/provenance/signing jobs build the assets. |
+| `.github/workflows/ci.yml` | Publish fork releases from `v*` tags when dispatched with `release=true` (non-draft) and skip upstream `v*` tag pushes in the fork; its existing binary/SBOM/provenance/signing jobs build the assets. |
 
 All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`,
 `.github/*`), which never conflict on rebase.
@@ -241,17 +241,17 @@ skips with the reasons recorded here.
     Daily it checks whether the latest upstream release tag is already in
     `podman`; on a new tag it rebases `podman` onto that tag, runs the unit
     suite and the e2e matrix below, then force-pushes `podman`, tags
-    `podman-vX.Y.Z`, and dispatches `ci.yml` at that tag. `ci.yml` reuses its
+    `vX.Y.Z`, and dispatches `ci.yml` at that tag. `ci.yml` reuses its
     existing binary and finalize jobs to build the cross-platform binaries,
     named as on docker/compose (`docker-compose-linux-x86_64`, ...), with SBOM
     (`.sbom.json`), SLSA provenance (`.provenance.json`), signature
     (`.sigstore.json`), `.sha256` and a `checksums.txt`, then publishes the
-    release. The release branch is exactly the upstream release with the
-    overlay on top: the workflow adds no bookkeeping commits and fetches only
-    the tag, never upstream's branches. A failed rebase or test regression
-    leaves `podman` and the releases untouched and files an issue instead. The
-    upstream `v*` tag release path in `ci.yml` stays a draft and is skipped in
-    the fork. Set the repo to allow GitHub Actions to create and dispatch
+    release, with a Podman note and the upstream release changelog. The
+    release branch is exactly the upstream release with the overlay on top:
+    the workflow adds no bookkeeping commits and fetches only the tag, never
+    upstream's branches. A failed rebase or test regression leaves `podman`
+    and the releases untouched and files an issue instead. The upstream `v*`
+    tag release path in `ci.yml` stays a draft and is skipped in the fork. Set the repo to allow GitHub Actions to create and dispatch
     releases.
   - `.github/workflows/podman-e2e.yml` runs the e2e smoke suite against the
     Podman matrix. The static test binary executes inside a privileged
