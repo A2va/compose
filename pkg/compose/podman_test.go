@@ -27,14 +27,16 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/moby/moby/api/types/mount"
 	"gotest.tools/v3/assert"
+
+	"github.com/docker/compose/v5/internal/engine"
 )
 
 func resetPodmanState(t *testing.T) {
 	t.Helper()
 	previous := rootfulPodmanSocket
-	podmanProfile = false
+	engine.SetPodmanProfile(false)
 	t.Cleanup(func() {
-		podmanProfile = false
+		engine.SetPodmanProfile(false)
 		rootfulPodmanSocket = previous
 	})
 }
@@ -191,6 +193,7 @@ func TestPodmanHostPort(t *testing.T) {
 }
 
 func TestCreateTarIncludesParentsAndOwnership(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix:///run/podman/podman.sock")
 	mode := types.FileMode(0o440)
 	b, err := createTar("hello", types.FileReferenceConfig{
 		Target: "/run/secrets/bar",

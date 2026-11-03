@@ -180,18 +180,22 @@ func createTar(env string, config types.FileReferenceConfig) (bytes.Buffer, erro
 		gid = v
 	}
 
-	name := strings.TrimPrefix(config.Target, "/")
-	if dir := path.Dir(name); dir != "." {
-		parts := strings.Split(dir, "/")
-		for i := range parts {
-			err := tarWriter.WriteHeader(&tar.Header{
-				Name:     strings.Join(parts[:i+1], "/") + "/",
-				Mode:     0o755,
-				Typeflag: tar.TypeDir,
-				ModTime:  time.Now(),
-			})
-			if err != nil {
-				return bytes.Buffer{}, err
+	name := config.Target
+	if isPodman() {
+		// Podman drops absolute tar names and needs the parent directories.
+		name = strings.TrimPrefix(config.Target, "/")
+		if dir := path.Dir(name); dir != "." {
+			parts := strings.Split(dir, "/")
+			for i := range parts {
+				err := tarWriter.WriteHeader(&tar.Header{
+					Name:     strings.Join(parts[:i+1], "/") + "/",
+					Mode:     0o755,
+					Typeflag: tar.TypeDir,
+					ModTime:  time.Now(),
+				})
+				if err != nil {
+					return bytes.Buffer{}, err
+				}
 			}
 		}
 	}

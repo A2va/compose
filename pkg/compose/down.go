@@ -465,7 +465,7 @@ func (s *composeService) stopContainer(ctx context.Context, service *types.Servi
 	if isPodman() && ctr.State == containerType.StatePaused {
 		// Podman refuses to stop a paused container.
 		if _, err := s.apiClient().ContainerUnpause(ctx, ctr.ID, client.ContainerUnpauseOptions{}); err != nil {
-			s.events.On(errorEvent(eventName, "Error while Unpausing"))
+			s.events.On(progress.Error(eventName, "Error while Unpausing"))
 			return err
 		}
 	}
