@@ -123,12 +123,14 @@ binary, `pkg/compose/build_bake.go:182`).
 | `pkg/compose/build_classic.go` | Materialize `build.dockerfile_inline` to a temp file for the classic builder (it otherwise requires a Dockerfile on disk), and fingerprint build args into an image label so buildah's cache cannot hide a changed arg behind an unchanged image ID. |
 | `pkg/compose/create.go` | Podman-only: expand published port ranges by replica index (`podmanHostPort`), map `json-file` to `k8s-file`, mount an anonymous volume at `/run/secrets` for secrets (`podmanSecretVolume`), skip structured secret/config mounts, skip legacy `links` and publish link aliases on the target's endpoints (`podmanLinkAliases`). |
 | `pkg/compose/pull.go` | If Podman, resolve image digests via `registry.RemoteDigest` (`internal/registry/remote.go`) because Podman has no `GET /distribution/{name}/json`. |
-| `pkg/compose/secrets.go` | Tar entries use relative names and include parent directories, and Podman skips `copyUIDGID` so the declared uid/gid/mode survive extraction. |
-| `pkg/compose/ps.go` | Podman <1.44 omits EXPOSE'd ports from `/containers/json` and the host IP from published ports; restore both for `compose ps`/`port`. |
+| `pkg/compose/secrets.go` | On Podman, tar entries use relative names and include parent directories, and `copyUIDGID` is skipped so the declared uid/gid/mode survive extraction. |
+| `internal/inspect/ps.go` | Podman <1.44 omits EXPOSE'd ports from `/containers/json` and the host IP from published ports; restore both for `compose ps`/`port`. |
 | `pkg/compose/monitor.go` | Filter one-off containers from the initial set and the event loop: Podman does not always apply the event stream's one-off label filter, which made a `compose run` exit abort an attached `up`. |
 | `pkg/compose/up.go`, `pkg/compose/logs.go` | Treat a container removed between its start event and log attach as already finished instead of failing `up`/`logs --follow`. |
-| `internal/sync/tar.go` | Retry without implied directory headers when the engine reports `file exists` (Podman's copier), in addition to Docker's symlink error. |
+| `internal/sync/tar.go` | Retry without implied directory headers when the engine reports `file exists` (Podman's copier), in addition to Docker's symlink error; when Podman 6 still reports `path escapes from parent`, resolve the target and copy there. |
+| `pkg/compose/watch.go` | `ResolvePath` runs `readlink -f` in the container so sync can write through a symlink Podman 6 refuses to traverse. |
 | `pkg/e2e/framework.go` | Pass `DOCKER_HOST` through to e2e commands, like `DOCKER_CONTEXT`, and copy the host `config.json` into the per-test config dir (the upstream check was inverted, which breaks podman-docker's CLI wrapper). |
+| `.github/workflows/ci.yml` | Publish fork releases from `podman-v*` tags (non-draft) and skip upstream `v*` releases in the fork; its existing binary/SBOM/provenance/signing jobs build the assets. |
 
 All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`,
 `.github/*`), which never conflict on rebase.
@@ -264,15 +266,29 @@ skips with the reasons recorded here.
   wires `podman compose ...` straight to it. No wrapper code needed.
 - CI:
   - `.github/workflows/sync-upstream.yml` automates the rebase recipe above.
-    Daily it compares upstream's latest release with `.github/upstream-release`;
-    on a new tag it rebases, builds, unit-tests, uploads the binary artifact and
-    opens a PR — or files a rebase-conflict issue when the overlay needs a
-    manual fix. Set the repo to allow GitHub Actions to create pull requests.
+    Daily it checks whether the latest upstream release tag is already in
+    `podman`; on a new tag it rebases `podman` onto that tag, runs the unit
+    suite and the e2e matrix below, then force-pushes `podman`, tags
+    `podman-vX.Y.Z`, and dispatches `ci.yml` at that tag. `ci.yml` reuses its
+    existing binary and finalize jobs to build the cross-platform binaries,
+    named as on docker/compose (`docker-compose-linux-x86_64`, ...), with SBOM
+    (`.sbom.json`), SLSA provenance (`.provenance.json`), signature
+    (`.sigstore.json`), `.sha256` and a `checksums.txt`, then publishes the
+    release. The release branch is exactly the upstream release with the
+    overlay on top: the workflow adds no bookkeeping commits and fetches only
+    the tag, never upstream's branches. A failed rebase or test regression
+    leaves `podman` and the releases untouched and files an issue instead. The
+    upstream `v*` tag release path in `ci.yml` stays a draft and is skipped in
+    the fork. Set the repo to allow GitHub Actions to create and dispatch
+    releases.
   - `.github/workflows/podman-e2e.yml` runs the e2e smoke suite against the
     Podman matrix. The static test binary executes inside a privileged
     container (`debian:12`, `ubuntu:24.04`, `fedora:latest`), so old Podman
-    versions need no host compatibility. Optional `DOCKERHUB_USERNAME` /
-    `DOCKERHUB_TOKEN` secrets raise Docker Hub pull limits.
+    versions need no host compatibility. The Fedora leg uses vfs storage and
+    a tmpfs for `/var/tmp`: Fedora 45's buildah rejects an overlay over a
+    build context on the container's overlay root. Optional
+    `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` secrets raise Docker Hub pull
+    limits.
 
 ## Testing
 
