@@ -44,6 +44,8 @@ type fakeLowLevelClient struct {
 	// onUntar, when set, is invoked at the start of every Untar call --
 	// used to observe how many run concurrently.
 	onUntar func()
+	// resolvePath, when set, maps a container path to its real location.
+	resolvePath func(string) (string, error)
 }
 
 func (f *fakeLowLevelClient) ContainersForService(_ context.Context, _ string, _ string) ([]container.Summary, error) {
@@ -53,6 +55,13 @@ func (f *fakeLowLevelClient) ContainersForService(_ context.Context, _ string, _
 func (f *fakeLowLevelClient) Exec(_ context.Context, _ string, cmd []string, _ io.Reader) error {
 	f.execCmds = append(f.execCmds, cmd)
 	return nil
+}
+
+func (f *fakeLowLevelClient) ResolvePath(_ context.Context, _ string, path string) (string, error) {
+	if f.resolvePath != nil {
+		return f.resolvePath(path)
+	}
+	return path, nil
 }
 
 func (f *fakeLowLevelClient) Untar(_ context.Context, _ string, reader io.ReadCloser) error {
@@ -332,6 +341,39 @@ func TestSync_RetriesWhenTheEngineReportsAnExistingDirectory(t *testing.T) {
 	_, sentDirHeader := retried["app/sub/"]
 	assert.Check(t, !sentDirHeader, "no header expected for the directory holding the synced files: %v", retried)
 	assert.Equal(t, retried["app/sub/data.txt"].Typeflag, byte(tar.TypeReg))
+}
+
+// Podman 6 rejects extracting through a symlink even without the directory headers. The copy
+// must go to the link's target instead, leaving the link in place (docker/compose#13795).
+func TestSync_ResolvesSymlinkedPathsWhenPodmanRejectsThem(t *testing.T) {
+	tmpDir := populatedSyncDir(t)
+
+	client := &fakeLowLevelClient{
+		containers: []container.Summary{{ID: "ctr1"}},
+		untarErrs: []error{
+			errors.New(`copier: put: error creating "/app/sub": mkdir /app/sub: file exists`),
+			errors.New(`Error response from daemon: statat app/sub/data.txt: path escapes from parent`),
+		},
+		resolvePath: func(path string) (string, error) {
+			if path == "/app/sub" {
+				return "/var/sub", nil
+			}
+			return path, nil
+		},
+	}
+	syncer := NewTar("proj", client, 0)
+
+	err := syncer.Sync(t.Context(), "svc", []*PathMapping{
+		{HostPath: filepath.Join(tmpDir, "sub"), ContainerPath: "/app/sub"},
+	})
+
+	assert.NilError(t, err)
+	assert.Equal(t, client.untarCount, 3)
+
+	resolved := client.untarHeaders[2]
+	assert.Equal(t, resolved["var/sub/data.txt"].Typeflag, byte(tar.TypeReg))
+	_, sentOriginal := resolved["app/sub/data.txt"]
+	assert.Check(t, !sentOriginal, "the copy must target the resolved path: %v", resolved)
 }
 
 func TestSync_ReportsTheCopyErrorWhenTheRetryFailsToo(t *testing.T) {

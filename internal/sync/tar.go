@@ -48,6 +48,7 @@ type LowLevelClient interface {
 
 	Exec(ctx context.Context, containerID string, cmd []string, in io.Reader) error
 	Untar(ctx context.Context, id string, reader io.ReadCloser) error
+	ResolvePath(ctx context.Context, containerID string, path string) (string, error)
 }
 
 type Tar struct {
@@ -103,7 +104,6 @@ func (t *Tar) Sync(ctx context.Context, service string, paths []*PathMapping) er
 
 	for i := range containers {
 		containerID := containers[i].ID
-		tarReader := tarArchive(pathsToCopy, keepImpliedDirectories)
 
 		eg.Go(func() error {
 			if len(deleteCmd) != 0 {
@@ -114,28 +114,10 @@ func (t *Tar) Sync(ctx context.Context, service string, paths []*PathMapping) er
 				}
 			}
 
-			if err := t.client.Untar(ctx, containerID, tarReader); err != nil {
-				// The engine answers with a plain 500, so the message is the only discriminator.
-				// Docker rejects a directory header through a symlink; Podman's copier instead
-				// tries to mkdir a directory the container already has and reports "file exists".
-				if !strings.Contains(err.Error(), "cannot overwrite non-directory") &&
-					!strings.Contains(err.Error(), "file exists") {
-					errMu.Lock()
-					errs = append(errs, fmt.Errorf("copying files to %s: %w", containerID, err))
-					errMu.Unlock()
-					return nil
-				}
-
-				// A directory header for a path the container resolves through a symlink (or
-				// already has) makes the engine reject the whole copy, so retry without the
-				// headers the archive's own entries already imply. That archive is a strict
-				// subset of the one that just failed, so sending it again is safe.
-				retry := tarArchive(pathsToCopy, dropImpliedDirectories)
-				if retryErr := t.client.Untar(ctx, containerID, retry); retryErr != nil {
-					errMu.Lock()
-					errs = append(errs, fmt.Errorf("copying files to %s: %w", containerID, errors.Join(err, retryErr)))
-					errMu.Unlock()
-				}
+			if err := t.copyWithFallbacks(ctx, containerID, pathsToCopy); err != nil {
+				errMu.Lock()
+				errs = append(errs, fmt.Errorf("copying files to %s: %w", containerID, err))
+				errMu.Unlock()
 			}
 			return nil // don't fail-fast; collect all errors
 		})
@@ -143,6 +125,73 @@ func (t *Tar) Sync(ctx context.Context, service string, paths []*PathMapping) er
 
 	_ = eg.Wait()
 	return errors.Join(errs...)
+}
+
+// copyWithFallbacks retries a copy the engine rejected for the shapes its
+// copier cannot take. The engine answers with a plain 500, so the message is
+// the only discriminator.
+func (t *Tar) copyWithFallbacks(ctx context.Context, containerID string, paths []PathMapping) error {
+	err := t.copyFiles(ctx, containerID, paths, keepImpliedDirectories)
+	if err == nil {
+		return nil
+	}
+	if isImpliedDirConflict(err) {
+		// A directory header for a path the container resolves through a symlink (or
+		// already has) makes the engine reject the whole copy, so retry without the
+		// headers the archive's own entries already imply. That archive is a strict
+		// subset of the one that just failed, so sending it again is safe.
+		retryErr := t.copyFiles(ctx, containerID, paths, dropImpliedDirectories)
+		if retryErr == nil {
+			return nil
+		}
+		err = errors.Join(err, retryErr)
+	}
+	if !isPathEscape(err) {
+		return err
+	}
+	// Podman 6 refuses to extract through a symlink at all; sync to its target
+	// instead, leaving the link itself in place.
+	resolved, changed, resolveErr := t.resolvePaths(ctx, containerID, paths)
+	if resolveErr != nil {
+		return errors.Join(err, fmt.Errorf("resolving symlinked paths: %w", resolveErr))
+	}
+	if !changed {
+		return err
+	}
+	if retryErr := t.copyFiles(ctx, containerID, resolved, dropImpliedDirectories); retryErr != nil {
+		return errors.Join(err, retryErr)
+	}
+	return nil
+}
+
+func (t *Tar) copyFiles(ctx context.Context, containerID string, paths []PathMapping, dropImpliedDirs bool) error {
+	return t.client.Untar(ctx, containerID, tarArchive(paths, dropImpliedDirs))
+}
+
+func (t *Tar) resolvePaths(ctx context.Context, containerID string, paths []PathMapping) ([]PathMapping, bool, error) {
+	resolved := make([]PathMapping, len(paths))
+	changed := false
+	for i, p := range paths {
+		target, err := t.client.ResolvePath(ctx, containerID, p.ContainerPath)
+		if err != nil {
+			return nil, false, err
+		}
+		if target != "" && target != p.ContainerPath {
+			p.ContainerPath = target
+			changed = true
+		}
+		resolved[i] = p
+	}
+	return resolved, changed, nil
+}
+
+func isImpliedDirConflict(err error) bool {
+	return strings.Contains(err.Error(), "cannot overwrite non-directory") ||
+		strings.Contains(err.Error(), "file exists")
+}
+
+func isPathEscape(err error) bool {
+	return strings.Contains(err.Error(), "path escapes from parent")
 }
 
 type ArchiveBuilder struct {
