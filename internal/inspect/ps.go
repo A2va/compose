@@ -63,7 +63,7 @@ func (s *Service) containerSummary(ctx context.Context, ctr container.Summary) (
 	if err != nil {
 		return api.ContainerSummary{}, err
 	}
-	if len(ctr.Ports) == 0 && isPodman() && inspect.Container.Config != nil {
+	if len(ctr.Ports) == 0 && engine.IsPodman() && inspect.Container.Config != nil {
 		// Podman <1.44 omits EXPOSE'd, unpublished ports from /containers/json.
 		for exposed := range inspect.Container.Config.ExposedPorts {
 			ctr.Ports = append(ctr.Ports, container.PortSummary{
@@ -106,7 +106,7 @@ func containerPublishers(ctr container.Summary) []api.PortPublisher {
 		var url string
 		if p.IP.IsValid() {
 			url = p.IP.String()
-		} else if isPodman() && p.PublicPort != 0 {
+		} else if engine.IsPodman() && p.PublicPort != 0 {
 			// Podman <1.44 omits the host IP for published ports.
 			url = "0.0.0.0"
 		}
