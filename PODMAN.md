@@ -9,9 +9,10 @@ and probing with rootless hints, classic-build forcing, registry digest
 fallback, e2e `DOCKER_HOST` support, link emulation, secret ownership, the P1
 compat shims (port ranges, `json-file`, `dockerfile_inline`, secrets/configs),
 build-arg image identity, watch sync into existing paths, one-off/log-attach
-races, default-bridge link injection, log-driver fallback and a CI matrix that
-runs the e2e suite against Podman 4.3 (Debian 12), 4.9 (Ubuntu 24.04) and
-current Fedora. Known Podman gaps are listed below.
+races, default-bridge link injection, log-driver fallback, the `compose ps`
+health suffix and a CI matrix that runs the e2e suite against Podman 4.3
+(Debian 12), 4.9 (Ubuntu 24.04) and current Fedora. Known Podman gaps are
+listed below.
 
 ## Goal
 
@@ -99,7 +100,7 @@ binary, `pkg/compose/build_bake.go:182`).
 | `pkg/compose/create.go` | Podman-only: expand published port ranges by replica index (`podmanHostPort`), map `json-file` to `k8s-file`, mount an anonymous volume at `/run/secrets` for secrets (`podmanSecretVolume`), skip structured secret/config mounts, skip legacy `links` and publish link aliases on the target's endpoints (`podmanLinkAliases`). |
 | `pkg/compose/pull.go` | If Podman, resolve image digests via `registry.RemoteDigest` (`internal/registry/remote.go`) because Podman has no `GET /distribution/{name}/json`. |
 | `pkg/compose/secrets.go` | On Podman, tar entries use relative names and include parent directories, and `copyUIDGID` is skipped so the declared uid/gid/mode survive extraction. |
-| `internal/inspect/ps.go` | Podman <1.44 omits EXPOSE'd ports from `/containers/json` and the host IP from published ports; restore both for `compose ps`/`port`. |
+| `internal/inspect/ps.go` | Podman <1.44 omits EXPOSE'd ports from `/containers/json` and the host IP from published ports, and Podman omits the health suffix Docker appends to the container status; restore all three for `compose ps`/`port`. |
 | `pkg/compose/monitor.go` | Filter one-off containers from the initial set and the event loop: Podman does not always apply the event stream's one-off label filter, which made a `compose run` exit abort an attached `up`. |
 | `pkg/compose/up.go`, `pkg/compose/logs.go` | Treat a container removed between its start event and log attach as already finished instead of failing `up`/`logs --follow`. |
 | `internal/sync/tar.go` | Retry without implied directory headers when the engine reports `file exists` (Podman's copier), in addition to Docker's symlink error; when Podman 6 still reports `path escapes from parent`, resolve the target and copy there. |
@@ -113,6 +114,9 @@ All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`,
 **Podman-only helpers (new files):**
 - `podman.go` — profile detection, socket selection/probing with rootless
   hints, `isPodman()`.
+- `internal/inspect/podman_status.go` — restores the `(healthy)`,
+  `(unhealthy)` or `(health: starting)` suffix Docker puts in the
+  `/containers/json` status field, so the `compose ps` table matches Docker.
 - `internal/registry/remote.go` — minimal registry client (Bearer challenge, OCI/Docker
   manifest `Accept` headers, body hashing) used by digest resolution. No new
   dependencies.
@@ -162,8 +166,9 @@ These are engine limitations, not missing compose features:
 Environment-dependent failures (not Podman bugs, but the CI container has no
 systemd and local runs can be rootless):
 
-- **Healthchecks** — Podman 4.3 schedules them with systemd timers; without
-  systemd they never leave `starting` (`TestLocalComposeUp`).
+- **Healthchecks on Podman 4.3** — Podman 4.3 schedules them with systemd
+  timers; without systemd they never leave `starting` (`TestLocalComposeUp`).
+  Podman 5.8 runs them normally, and the status suffix is restored for both.
 - **Ping-based tests in rootless mode** — rootless containers lack
   `CAP_NET_RAW` here (`TestWatchExec`, `TestUpStopWithLogsMixed`); they pass
   with rootful Podman in CI.
@@ -309,6 +314,10 @@ skips with the reasons recorded here.
   when it is missing, stale or inaccessible. No `podman build` shell-out:
   multi-platform builds stay a BuildKit-only feature with a clear
   classic-builder error, so the shell-out is deferred until it is needed.
+- **P5 (implemented)** — restore the health suffix Podman omits from the
+  container status so `compose ps` matches Docker and `TestLocalComposeUp`
+  passes on Podman 5.8. On 4.3 the suffix is restored too, but the healthcheck
+  itself still needs systemd (see known gaps).
 
 ## Overlay commit layout
 
