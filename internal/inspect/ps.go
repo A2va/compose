@@ -73,6 +73,10 @@ func (s *Service) containerSummary(ctx context.Context, ctr container.Summary) (
 		}
 	}
 	health, exitCode := containerHealthAndExitCode(inspect)
+	status := ctr.Status
+	if engine.IsPodman() {
+		status = podmanContainerStatus(status, health)
+	}
 	mounts, localVolumes := containerMounts(ctr)
 	return api.ContainerSummary{
 		ID:           ctr.ID,
@@ -83,7 +87,7 @@ func (s *Service) containerSummary(ctx context.Context, ctr container.Summary) (
 		Service:      ctr.Labels[api.ServiceLabel],
 		Command:      ctr.Command,
 		State:        ctr.State,
-		Status:       ctr.Status,
+		Status:       status,
 		Created:      ctr.Created,
 		Labels:       ctr.Labels,
 		SizeRw:       ctr.SizeRw,
