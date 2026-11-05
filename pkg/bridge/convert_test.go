@@ -23,12 +23,62 @@ import (
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/system"
 	"github.com/moby/moby/client"
 	"go.uber.org/mock/gomock"
 	"gotest.tools/v3/assert"
 
 	"github.com/docker/compose/v5/pkg/mocks"
 )
+
+func TestIsRootless(t *testing.T) {
+	cases := []struct {
+		name string
+		info system.Info
+		euid int
+		want bool
+	}{
+		{
+			name: "security option",
+			info: system.Info{SecurityOptions: []string{"name=seccomp", "name=rootless"}},
+			euid: 1000,
+			want: true,
+		},
+		{
+			name: "podman 4 per-user graph root",
+			info: system.Info{DockerRootDir: "/home/e2e/.local/share/containers/storage"},
+			euid: 1000,
+			want: true,
+		},
+		{
+			name: "rootful",
+			info: system.Info{
+				SecurityOptions: []string{"name=seccomp"},
+				DockerRootDir:   "/var/lib/docker",
+			},
+			euid: 1000,
+			want: false,
+		},
+		{
+			name: "per-user graph root as root",
+			info: system.Info{DockerRootDir: "/home/e2e/.local/share/containers/storage"},
+			euid: 0,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			dockerCLI := mocks.NewMockCli(mockCtrl)
+			apiClient := mocks.NewMockAPIClient(mockCtrl)
+			dockerCLI.EXPECT().Client().Return(apiClient).AnyTimes()
+			apiClient.EXPECT().Info(gomock.Any(), client.InfoOptions{}).
+				Return(client.SystemInfoResult{Info: tc.info}, nil)
+
+			assert.Equal(t, isRootless(t.Context(), dockerCLI, tc.euid, "/home/e2e"), tc.want)
+		})
+	}
+}
 
 func TestLoadAdditionalResources_BuildOnlySkipsPull(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
