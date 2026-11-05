@@ -48,12 +48,17 @@ func hostRegistryConfig() *configfile.ConfigFile {
 // given configuration.
 func newAPISocketTestService(t *testing.T, config *configfile.ConfigFile) *composeService {
 	t.Helper()
+	return newAPISocketTestServiceForHost(t, config, "unix:///var/run/docker.sock")
+}
+
+func newAPISocketTestServiceForHost(t *testing.T, config *configfile.ConfigFile, host string) *composeService {
+	t.Helper()
 	mockCtrl := gomock.NewController(t)
 	cli := mocks.NewMockCli(mockCtrl)
 	apiClient := mocks.NewMockAPIClient(mockCtrl)
 	cli.EXPECT().Client().Return(apiClient).AnyTimes()
 	cli.EXPECT().ConfigFile().Return(config).AnyTimes()
-	apiClient.EXPECT().DaemonHost().Return("unix:///var/run/docker.sock").AnyTimes()
+	apiClient.EXPECT().DaemonHost().Return(host).AnyTimes()
 	svc, err := NewComposeService(cli, WithEventProcessor(progress.Noop{}), WithContextInfo(linuxContextInfo{}))
 	assert.NilError(t, err)
 	return svc.(*composeService)
@@ -94,6 +99,22 @@ func TestUseAPISocketIsIdempotent(t *testing.T) {
 	service = twice.Services["app"]
 	assert.Equal(t, len(service.Volumes), 1, "volumes: %v", service.Volumes)
 	assert.Equal(t, len(service.Configs), 1, "configs: %v", service.Configs)
+}
+
+// TestUseAPISocketMountsPodmanSocket verifies that a Podman engine gets its
+// own socket mounted, at the Docker path services expect: Docker's
+// /var/run/docker.sock does not exist on a Podman host.
+func TestUseAPISocketMountsPodmanSocket(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix:///run/user/1000/podman/podman.sock")
+	svc := newAPISocketTestServiceForHost(t, hostRegistryConfig(), "unix:///run/user/1000/podman/podman.sock")
+
+	project, err := svc.useAPISocket(apiSocketProject(apiSocketService("app", types.MappingWithEquals{})))
+
+	assert.NilError(t, err)
+	service := project.Services["app"]
+	assert.Equal(t, len(service.Volumes), 1, "volumes: %v", service.Volumes)
+	assert.Equal(t, service.Volumes[0].Source, "/run/user/1000/podman/podman.sock")
+	assert.Equal(t, service.Volumes[0].Target, "/var/run/docker.sock")
 }
 
 // TestUseAPISocketCredentialsAreForRootOnly pins who can read the registry

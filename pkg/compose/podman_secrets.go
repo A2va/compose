@@ -24,11 +24,13 @@ import (
 	"github.com/moby/moby/api/types/mount"
 )
 
-// podmanSecretVolume mounts an anonymous volume at /run/secrets when a secret
-// targets that directory. Podman mounts a tmpfs there, which shadows files
-// written to a stopped container; archive copies do write through volumes, so
-// the uid/gid/mode declared on the secret are preserved.
-func podmanSecretVolume(service types.ServiceConfig, mounts []mount.Mount) []mount.Mount {
+// podmanFileReferenceVolume mounts an anonymous volume at /run/secrets when a
+// secret or config targets that directory. Podman mounts a tmpfs there, which
+// shadows files written to a stopped container; archive copies do write
+// through volumes, so the uid/gid/mode declared on the reference are
+// preserved. Configs count too: use_api_socket injects its docker config as
+// one, under /run/secrets/docker.
+func podmanFileReferenceVolume(service types.ServiceConfig, mounts []mount.Mount) []mount.Mount {
 	for _, m := range mounts {
 		if path.Clean(m.Target) == "/run/secrets" {
 			return nil
@@ -41,10 +43,25 @@ func podmanSecretVolume(service types.ServiceConfig, mounts []mount.Mount) []mou
 		} else if !isAbsTarget(target) {
 			target = "/run/secrets/" + target
 		}
-		target = path.Clean(target)
-		if target == "/run/secrets" || strings.HasPrefix(target, "/run/secrets/") {
+		if isUnderRunSecrets(target) {
+			return []mount.Mount{{Type: mount.TypeVolume, Target: "/run/secrets"}}
+		}
+	}
+	for _, config := range service.Configs {
+		target := config.Target
+		if target == "" {
+			target = "/" + config.Source
+		} else if !isAbsTarget(target) {
+			target = "/" + target
+		}
+		if isUnderRunSecrets(target) {
 			return []mount.Mount{{Type: mount.TypeVolume, Target: "/run/secrets"}}
 		}
 	}
 	return nil
+}
+
+func isUnderRunSecrets(target string) bool {
+	target = path.Clean(target)
+	return target == "/run/secrets" || strings.HasPrefix(target, "/run/secrets/")
 }

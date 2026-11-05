@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -205,4 +206,14 @@ func probePodmanSocket(path string) (bool, error) {
 
 func isPodman() bool {
 	return engine.IsPodman()
+}
+
+// podmanSocketHostPath returns the filesystem path of the Podman API socket
+// from the docker-compatible daemon host, or "" when it is not a unix socket.
+func podmanSocketHostPath(daemonHost string) string {
+	u, err := url.Parse(daemonHost)
+	if err != nil || u.Scheme != "unix" {
+		return ""
+	}
+	return u.Path
 }

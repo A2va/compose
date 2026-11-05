@@ -99,13 +99,23 @@ func (s *composeService) useAPISocket(project *types.Project) (*types.Project, e
 		Content: configBuf.String(),
 	}
 
+	// Podman's own API socket lives on a different path than Docker's. Mount
+	// that one at the Docker path the services expect, so the bind source
+	// exists and the socket is usable inside the container.
+	socketSource := "/var/run/docker.sock"
+	if isPodman() {
+		if path := podmanSocketHostPath(s.apiClient().DaemonHost()); path != "" {
+			socketSource = path
+		}
+	}
+
 	for name, service := range project.Services {
 		if !service.UseAPISocket {
 			continue
 		}
 		service.Volumes = append(service.Volumes, types.ServiceVolumeConfig{
 			Type:   types.VolumeTypeBind,
-			Source: "/var/run/docker.sock",
+			Source: socketSource,
 			Target: "/var/run/docker.sock",
 		})
 

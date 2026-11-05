@@ -196,7 +196,15 @@ func (s *composeService) execPreStartHook(
 	// Subscribe to wait before start to avoid missing the exit event for short-lived hooks.
 	// WaitConditionNotRunning would match immediately because the container is still in
 	// "created" state, so use WaitConditionNextExit to block until the run actually finishes.
-	waitRes := s.apiClient().ContainerWait(ctx, containerID, client.ContainerWaitOptions{
+	//
+	// The wait gets its own context: when the start fails, the container is
+	// removed and the daemon may never answer the pending wait (Podman keeps
+	// the request open instead of failing it like Docker). Cancelling the wait
+	// context releases the client goroutine, so failing `up` returns the start
+	// error instead of hanging on a wait for a container that never ran.
+	waitCtx, cancelWait := context.WithCancel(ctx)
+	defer cancelWait()
+	waitRes := s.apiClient().ContainerWait(waitCtx, containerID, client.ContainerWaitOptions{
 		Condition: container.WaitConditionNextExit,
 	})
 
@@ -208,10 +216,12 @@ func (s *composeService) execPreStartHook(
 		}
 		// Drain waitRes so the client's wait goroutine exits without having to
 		// wait for the parent context to be canceled.
+		cancelWait()
 		select {
 		case <-waitRes.Error: //nolint:errcheck // only draining: the error that matters is the one being returned
 		case <-waitRes.Result:
 		case <-ctx.Done():
+		case <-time.After(s.drainTimeout()):
 		}
 		// The daemon's error (a missing executable, a bad mount…) names neither
 		// the hook nor its image, and surfaces on the row of the service
