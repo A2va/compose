@@ -127,6 +127,21 @@ func (exec *planExecutor) execCreateContainer(ctx context.Context, node *PlanNod
 	exec.containersMu.Lock()
 	exec.containersByService[op.Service.Name] = append(exec.containersByService[op.Service.Name], ctr)
 	exec.containersMu.Unlock()
+
+	if isPodman() && exec.injectAtCreate && op.Service != nil {
+		// Podman copies an archive into the container's root filesystem when an
+		// attach stream is already open (interactive up attaches before the
+		// start phase), so files injected right before ContainerStart are
+		// shadowed by the anonymous /run/secrets volume once it mounts. Inject
+		// them at create time, when no attach exists yet, so they land in the
+		// volume; the start phase repeats the copy harmlessly.
+		if err := exec.compose.injectSecrets(ctx, exec.project, service, ctr.ID); err != nil {
+			return err
+		}
+		if err := exec.compose.injectConfigs(ctx, exec.project, service, ctr.ID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

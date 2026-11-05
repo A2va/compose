@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -140,7 +141,7 @@ func (s *Service) logContainer(ctx context.Context, limiter *semaphore.Weighted,
 		return err
 	}
 	err = s.DoLogContainer(ctx, limiter, consumer, naming.ContainerNameWithoutProject(ctr), res, options, nil)
-	if errdefs.IsNotFound(err) {
+	if errdefs.IsNotFound(err) || podmanContainerRemoved(err) {
 		return nil
 	}
 	if errdefs.IsNotImplemented(err) {
@@ -148,6 +149,20 @@ func (s *Service) logContainer(ctx context.Context, limiter *semaphore.Weighted,
 		return nil
 	}
 	return err
+}
+
+// podmanContainerRemoved reports the error Podman returns when a container is
+// removed between the inspect that opened a log stream and the log request
+// itself. It answers with a generic 500 ("no container with ID ... found in
+// database"), not the 404 errdefs.IsNotFound recognizes, so callers that treat
+// a vanished container as already finished need this too.
+func podmanContainerRemoved(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no container with ID") &&
+		strings.Contains(msg, "found in database")
 }
 
 // FollowStartedContainersLogs streams the logs of containers (re)started
@@ -197,7 +212,7 @@ func (s *Service) FollowStartedContainersLogs(
 				Tail:       options.Tail,
 				Timestamps: options.Timestamps,
 			}, turn.Cursor)
-			if errdefs.IsNotImplemented(err) || errdefs.IsNotFound(err) {
+			if errdefs.IsNotImplemented(err) || errdefs.IsNotFound(err) || podmanContainerRemoved(err) {
 				// ignore
 				return nil
 			}
