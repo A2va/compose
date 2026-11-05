@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/containerd/errdefs"
@@ -129,6 +130,31 @@ func isEmptyOrMissingDir(dir string) (bool, error) {
 	return len(entries) == 0, nil
 }
 
+// isRootless reports whether the engine maps container root to the invoking
+// user. Docker and current Podman advertise this in /info SecurityOptions;
+// Podman 4.x only sets the top-level Rootless field, which the Docker client
+// drops, so fall back to its default per-user graph root.
+func isRootless(ctx context.Context, dockerCli command.Cli, euid int, homeDir string) bool {
+	info, err := dockerCli.Client().Info(ctx, client.InfoOptions{})
+	if err != nil {
+		return false
+	}
+	for _, option := range info.Info.SecurityOptions {
+		if option == "name=rootless" {
+			return true
+		}
+	}
+	if euid == 0 || homeDir == "" {
+		return false
+	}
+	// Podman 4.x only reports rootless in the top-level Rootless field, which
+	// the Docker client drops. Compare the engine's graph root with the user's
+	// passwd home instead of $HOME, which the e2e harness overrides per test.
+	graphRoot := filepath.Join(homeDir, ".local", "share", "containers", "storage")
+	return info.Info.DockerRootDir == graphRoot ||
+		strings.HasPrefix(info.Info.DockerRootDir, graphRoot+string(os.PathSeparator))
+}
+
 func convert(ctx context.Context, dockerCli command.Cli, model map[string]any, opts ConvertOptions) error {
 	raw, err := yaml.Marshal(model)
 	if err != nil {
@@ -156,6 +182,15 @@ func convert(ctx context.Context, dockerCli command.Cli, model map[string]any, o
 	if err != nil {
 		return err
 	}
+	// A rootless engine maps container root to the invoking user, so the
+	// transformer must run as container root to read the 0600 input and write
+	// the output bind mounts. A rootful engine (including a rootful daemon
+	// reached by a non-root client) keeps the historical host-uid setting.
+	homeDir := ""
+	if usr, err := user.Current(); err == nil {
+		homeDir = usr.HomeDir
+	}
+	rootless := isRootless(ctx, dockerCli, os.Geteuid(), homeDir)
 	binds := []string{
 		fmt.Sprintf("%s:%s", dir, "/in"),
 		fmt.Sprintf("%s:%s", out, "/out"),
@@ -179,13 +214,17 @@ func convert(ctx context.Context, dockerCli command.Cli, model map[string]any, o
 			Env:   []string{"LICENSE_AGREEMENT=true"},
 		}
 		// On POSIX systems, this is a decimal number representing the uid.
-		// On Windows, this is a security identifier (SID) in a string format and the engine isn't able to manage it
+		// On Windows, this is a security identifier (SID) in a string format and the engine isn't able to manage it.
 		if runtime.GOOS != "windows" {
-			usr, err := user.Current()
-			if err != nil {
-				return err
+			if rootless {
+				containerConfig.User = "0"
+			} else {
+				usr, err := user.Current()
+				if err != nil {
+					return err
+				}
+				containerConfig.User = usr.Uid
 			}
-			containerConfig.User = usr.Uid
 		}
 		created, err := dockerCli.Client().ContainerCreate(ctx, client.ContainerCreateOptions{
 			Config: containerConfig,
