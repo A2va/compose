@@ -578,6 +578,49 @@ func TestPreStart_ContainerStartFailureNamesTheHook(t *testing.T) {
 	assert.ErrorIs(t, err, daemonErr)
 }
 
+// TestPreStart_StartFailureDoesNotHangOnWait pins the Podman failure mode: a
+// container that never started is removed, but Podman keeps the pending
+// NextExit wait open instead of failing it like Docker. `up` must return the
+// start error, bounded by the drain timeout, rather than wait forever.
+func TestPreStart_StartFailureDoesNotHangOnWait(t *testing.T) {
+	tested, apiClient := newPreStartTestService(t)
+	tested.logStreamDrainTimeout = 50 * time.Millisecond
+
+	project := &types.Project{Name: "demo"}
+	service := types.ServiceConfig{
+		Name:          "web",
+		ContainerSpec: types.ContainerSpec{Image: "alpine"},
+		PreStart: []types.PreStartHook{
+			{ContainerSpec: types.ContainerSpec{Image: "hello-world", Command: types.ShellCommand{"echo", "hook ran"}}},
+		},
+	}
+	daemonErr := errors.New(`exec: "/bin/busybox": stat /bin/busybox: no such file or directory`)
+
+	scan := expectRunnerScan(apiClient, runnerSummary("hook-1", 0))
+	// The wait never answers: both channels stay open.
+	apiClient.EXPECT().ContainerWait(gomock.Any(), "hook-1", gomock.Any()).
+		Return(client.ContainerWaitResult{
+			Result: make(chan container.WaitResponse),
+			Error:  make(chan error),
+		}).After(scan)
+	apiClient.EXPECT().ContainerStart(gomock.Any(), "hook-1", gomock.Any()).
+		Return(client.ContainerStartResult{}, daemonErr)
+	apiClient.EXPECT().ContainerRemove(gomock.Any(), "hook-1", client.ContainerRemoveOptions{Force: true, RemoveVolumes: true}).
+		Return(client.ContainerRemoveResult{}, nil)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- tested.runPreStart(t.Context(), project, service, func(api.ContainerEvent) {})
+	}()
+	select {
+	case err := <-done:
+		assert.ErrorContains(t, err, "failed to start the hook container")
+		assert.ErrorIs(t, err, daemonErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("pre_start start failure hung on the pending wait")
+	}
+}
+
 // TestPreStart_WaitResultPreferredOverNilError pins the fix for the scheduler
 // race in waitPreStart: when ContainerWait closes a successful stream cleanly
 // it delivers Result (exit code) AND a nil send on Error at the same time.
