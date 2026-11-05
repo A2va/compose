@@ -127,6 +127,7 @@ func (s *composeService) prepareUp(ctx context.Context, project *types.Project, 
 	// healthy" with no wait ever actually timing out.
 	exec := s.newPlanExecutor(project, observed)
 	exec.waitTimeout = options.Start.WaitTimeout
+	exec.injectAtCreate = options.Start.Attach != nil
 	return project, exec, plan, nil
 }
 
@@ -659,6 +660,11 @@ func (u *upSession) streamContainerLogs(turn *logstream.Turn, event api.Containe
 		Follow: true,
 		Since:  since,
 	}, turn.Cursor)
+	if podmanContainerRemoved(err) {
+		// Podman can remove the container between the inspect above and the
+		// log request: it is already finished, so nothing is left to relay.
+		return nil
+	}
 	if errdefs.IsNotImplemented(err) {
 		// container may be configured with logging_driver: none
 		// as container already started, we might miss the very first logs. But still better than none

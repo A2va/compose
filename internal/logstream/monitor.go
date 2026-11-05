@@ -192,10 +192,7 @@ func (c *Monitor) Start(ctx context.Context) error {
 		case err := <-res.Err:
 			return err
 		case event := <-res.Messages:
-			if isOneOff(event.Actor.Attributes) {
-				continue
-			}
-			if !c.watched(event.Actor.Attributes[api.ServiceLabel]) {
+			if !c.watchesEvent(event.Actor.Attributes) {
 				continue
 			}
 			ctr, err := c.getContainerSummary(event)
@@ -278,10 +275,10 @@ func (c *Monitor) initialContainers(ctx context.Context) (utils.Set[string], err
 	}
 	containers := utils.Set[string]{}
 	for _, ctr := range initialState.Items {
-		if isOneOff(ctr.Labels) {
+		if !c.watchesEvent(ctr.Labels) {
 			continue
 		}
-		if c.watched(ctr.Labels[api.ServiceLabel]) && !relaymgr.IsRelay(ctr.Labels) {
+		if !relaymgr.IsRelay(ctr.Labels) {
 			containers.Add(ctr.ID)
 		}
 	}
@@ -295,10 +292,26 @@ func isOneOff(labels map[string]string) bool {
 	return labels[api.OneoffLabel] == "True"
 }
 
+// isHookContainer reports whether labels identify a lifecycle hook runner.
+// Hook runners carry the target service's labels but are none of its replicas:
+// treating their start or exit as the service's makes a foreground `up` abort
+// on a successful hook (or fail to attach to its logs once Podman has removed
+// the runner). Filter them from the event stream, like one-offs.
+func isHookContainer(labels map[string]string) bool {
+	return labels[api.HookLabel] != ""
+}
+
 // watched tells whether a service's containers are watched by this monitor.
 // An empty service set means "the whole application".
 func (c *Monitor) watched(service string) bool {
 	return len(c.services) == 0 || c.services[service]
+}
+
+// watchesEvent reports whether an event's container belongs to this monitor's
+// application: neither a one-off nor a lifecycle-hook runner, and in a watched
+// service.
+func (c *Monitor) watchesEvent(labels map[string]string) bool {
+	return !isOneOff(labels) && !isHookContainer(labels) && c.watched(labels[api.ServiceLabel])
 }
 
 // notify broadcasts a container event to the registered listeners

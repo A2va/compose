@@ -52,6 +52,13 @@ type planExecutor struct {
 	containersMu        sync.Mutex
 	containersByService map[string]Containers
 
+	// injectAtCreate copies secrets/configs while creating the container. Only
+	// interactive up needs it: it attaches before the Start phase, and Podman
+	// then extracts the archive into the root filesystem instead of the
+	// /run/secrets volume. Every other caller injects right before starting,
+	// like Docker, so `create` does not resolve environment secrets early.
+	injectAtCreate bool
+
 	// waitTimeout, when non-zero, bounds OpWaitCondition nodes only (see
 	// executeNode) -- not the rest of the plan, and with its OWN fresh
 	// window per wait node rather than a single shared deadline counted
