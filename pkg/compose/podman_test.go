@@ -27,7 +27,10 @@ import (
 
 	"github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
+	"go.uber.org/mock/gomock"
 	"gotest.tools/v3/assert"
 
 	"github.com/docker/compose/v5/internal/engine"
@@ -378,6 +381,12 @@ func TestIsPodmanFromDaemonHost(t *testing.T) {
 	assert.Assert(t, !isPodman())
 }
 
+func TestPodmanSocketHostPath(t *testing.T) {
+	assert.Equal(t, podmanSocketHostPath("unix:///run/user/1000/podman/podman.sock"), "/run/user/1000/podman/podman.sock")
+	assert.Equal(t, podmanSocketHostPath("tcp://127.0.0.1:2375"), "")
+	assert.Equal(t, podmanSocketHostPath("not a url"), "")
+}
+
 func TestPodmanHostPort(t *testing.T) {
 	for _, tc := range []struct {
 		published string
@@ -428,6 +437,62 @@ func TestCreateTarIncludesParentsAndOwnership(t *testing.T) {
 	assert.Equal(t, file.Mode, int64(0o440))
 }
 
+func TestPodmanInjectsSecretsAtCreateOnlyForAttachedUp(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		injectAtCreate bool
+	}{
+		{name: "create and detached up", injectAtCreate: false},
+		{name: "interactive up", injectAtCreate: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DOCKER_HOST", "unix:///run/user/1000/podman/podman.sock")
+			svc, apiClient, _ := newStartPhaseTestService(t)
+
+			service := types.ServiceConfig{
+				Name: "web",
+				ContainerSpec: types.ContainerSpec{
+					Image:   "alpine",
+					Secrets: []types.ServiceSecretConfig{{Source: "token"}},
+				},
+			}
+			project := &types.Project{
+				Name:     "test",
+				Services: types.Services{"web": service},
+				Secrets:  types.Secrets{"token": types.SecretConfig{Name: "token", Content: "s3cret"}},
+			}
+
+			apiClient.EXPECT().ContainerCreate(gomock.Any(), gomock.Any()).
+				Return(client.ContainerCreateResult{ID: "web-id"}, nil)
+			apiClient.EXPECT().ContainerInspect(gomock.Any(), "web-id", gomock.Any()).
+				Return(client.ContainerInspectResult{Container: container.InspectResponse{
+					ID:              "web-id",
+					Name:            "/test-web-1",
+					Config:          &container.Config{},
+					NetworkSettings: &container.NetworkSettings{},
+				}}, nil)
+			if tc.injectAtCreate {
+				apiClient.EXPECT().CopyToContainer(gomock.Any(), "web-id", gomock.Any()).
+					Return(client.CopyToContainerResult{}, nil)
+			}
+
+			plan := &Plan{}
+			plan.addNode(Operation{
+				Type:       OpCreateContainer,
+				ResourceID: "service:web:1",
+				Cause:      "no existing container",
+				Service:    &service,
+				Name:       "test-web-1",
+				Number:     1,
+			}, "")
+
+			exec := svc.newPlanExecutor(project, emptyObservedState("test"))
+			exec.injectAtCreate = tc.injectAtCreate
+			assert.NilError(t, exec.run(t.Context(), plan))
+		})
+	}
+}
+
 func TestPodmanLinkAliases(t *testing.T) {
 	project := &types.Project{
 		Name: "test",
@@ -450,11 +515,11 @@ func TestPodmanLinkAliases(t *testing.T) {
 	assert.DeepEqual(t, podmanLinkAliases(project, project.Services["cache"], "default"), []string(nil))
 }
 
-func TestPodmanSecretVolume(t *testing.T) {
+func TestPodmanFileReferenceVolume(t *testing.T) {
 	service := types.ServiceConfig{ContainerSpec: types.ContainerSpec{
 		Secrets: []types.ServiceSecretConfig{{Source: "token"}},
 	}}
-	mounts := podmanSecretVolume(service, nil)
+	mounts := podmanFileReferenceVolume(service, nil)
 	assert.Equal(t, len(mounts), 1)
 	assert.Equal(t, string(mounts[0].Type), "volume")
 	assert.Equal(t, mounts[0].Target, "/run/secrets")
@@ -462,8 +527,20 @@ func TestPodmanSecretVolume(t *testing.T) {
 	absolute := types.ServiceConfig{ContainerSpec: types.ContainerSpec{
 		Secrets: []types.ServiceSecretConfig{{Source: "token", Target: "/etc/token"}},
 	}}
-	assert.Equal(t, len(podmanSecretVolume(absolute, nil)), 0)
+	assert.Equal(t, len(podmanFileReferenceVolume(absolute, nil)), 0)
+
+	// A config injected under /run/secrets (use_api_socket) needs it too.
+	config := types.ServiceConfig{ContainerSpec: types.ContainerSpec{
+		Configs: []types.ServiceConfigObjConfig{{Source: "#apisocket", Target: "/run/secrets/docker/config.json"}},
+	}}
+	assert.Equal(t, len(podmanFileReferenceVolume(config, nil)), 1)
+
+	// A config at its default location is not in the tmpfs.
+	defaultConfig := types.ServiceConfig{ContainerSpec: types.ContainerSpec{
+		Configs: []types.ServiceConfigObjConfig{{Source: "app.conf"}},
+	}}
+	assert.Equal(t, len(podmanFileReferenceVolume(defaultConfig, nil)), 0)
 
 	// A user-provided mount at /run/secrets takes precedence.
-	assert.Equal(t, len(podmanSecretVolume(service, []mount.Mount{{Target: "/run/secrets"}})), 0)
+	assert.Equal(t, len(podmanFileReferenceVolume(service, []mount.Mount{{Target: "/run/secrets"}})), 0)
 }

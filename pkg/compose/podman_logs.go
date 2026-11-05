@@ -18,9 +18,24 @@ package compose
 
 import (
 	"slices"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 )
+
+// podmanContainerRemoved reports the error Podman returns when a container is
+// removed between the inspect that opened a log stream and the log request
+// itself. It answers with a generic 500 ("no container with ID ... found in
+// database"), not the 404 errdefs.IsNotFound recognizes, so callers that treat
+// a vanished container as already finished need this too.
+func podmanContainerRemoved(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no container with ID") &&
+		strings.Contains(msg, "found in database")
+}
 
 // podmanLogDriver maps Docker-only drivers to a Podman-supported one. Podman
 // rejects the container create otherwise; k8s-file keeps the output locally.
