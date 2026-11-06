@@ -1,0 +1,78 @@
+name: podman-e2e
+
+# P2 of PODMAN.md: exercise the fork against the supported Podman versions.
+# The e2e binary is built statically on the runner and executed inside a
+# privileged container, so Podman 4.3/4.9 can be tested without host
+# compatibility constraints. Every version runs in both rootless and rootful
+# modes; known engine gaps are excluded in the script.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  # Manual only: run on demand from the Actions tab. The nightly/upstream sync
+  # (sync-upstream.yml) has its own e2e job for the rebased overlay.
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    name: e2e (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: podman-4.3-debian-12-rootless
+            image: debian:12
+            storage: overlay
+            rootless: "1"
+          - name: podman-4.3-debian-12-rootful
+            image: debian:12
+            storage: overlay
+            rootless: "0"
+          - name: podman-4.9-ubuntu-24.04-rootless
+            image: ubuntu:24.04
+            storage: overlay
+            rootless: "1"
+          - name: podman-4.9-ubuntu-24.04-rootful
+            image: ubuntu:24.04
+            storage: overlay
+            rootless: "0"
+          - name: podman-current-fedora-rootless
+            image: fedora:latest
+            storage: vfs # buildah on Fedora 45 rejects an overlay over the build context
+            rootless: "1"
+          - name: podman-current-fedora-rootful
+            image: fedora:latest
+            storage: vfs # buildah on Fedora 45 rejects an overlay over the build context
+            rootless: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build static binaries
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          make build GO_BUILDTAGS="e2e standalone"
+          make example-provider
+          go test -c -tags "e2e standalone" -o bin/e2e.test ./pkg/e2e
+
+      - name: Run e2e against ${{ matrix.name }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          STORAGE_DRIVER: ${{ matrix.storage }}
+          E2E_BIN: ${{ github.workspace }}/bin/build/docker-compose
+          E2E_ROOTLESS: ${{ matrix.rootless }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: bash .github/scripts/podman-e2e-container.sh
