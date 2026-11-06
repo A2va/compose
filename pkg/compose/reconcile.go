@@ -1127,7 +1127,18 @@ func (r *reconciler) hasNetworkMismatch(expected types.ServiceConfig, oc Observe
 		}
 		found := false
 		for name, netID := range oc.ConnectedNetworks {
-			if netID == obs.ID || (netID == "" && name == obs.Name) {
+			// Podman <5 reports the network name in NetworkID (both in the
+			// container summary and in this map). Accept it alongside the
+			// real ID so an unchanged container is not recreated on every
+			// up/scale; the ID still catches a genuinely recreated network.
+			if netID == obs.ID || (obs.Name != "" && netID == obs.Name) {
+				found = true
+				break
+			}
+			// A container created but never started has no network ID yet:
+			// its connection to the network of that name can't be told apart
+			// from the expected one, and is not a mismatch.
+			if netID == "" && name == obs.Name {
 				found = true
 				break
 			}
