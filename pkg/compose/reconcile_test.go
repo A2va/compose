@@ -152,6 +152,31 @@ func networkAttachedContainer(t *testing.T, svc types.ServiceConfig, id string) 
 	}
 }
 
+// TestHasNetworkMismatch_AcceptsNetworkName pins the Podman <5 compatibility
+// path: its container summary reports the network name in NetworkID, while the
+// reconciler expects the engine-assigned network ID.
+func TestHasNetworkMismatch_AcceptsNetworkName(t *testing.T) {
+	web := types.ServiceConfig{
+		Name:          "web",
+		ContainerSpec: types.ContainerSpec{Networks: map[string]*types.ServiceNetworkConfig{"frontend": {}}},
+	}
+	r := &reconciler{
+		project: &types.Project{
+			Name:     "myproject",
+			Networks: types.Networks{"frontend": {Name: "myproject_frontend"}},
+		},
+		resolvedNetworks: map[string]ObservedNetwork{
+			"frontend": {ID: "net1", Name: "myproject_frontend"},
+		},
+	}
+
+	oc := ObservedContainer{ConnectedNetworks: map[string]string{"myproject_frontend": "myproject_frontend"}}
+	assert.Check(t, !r.hasNetworkMismatch(web, oc), "a network name from Podman <5 must count as connected")
+
+	oc.ConnectedNetworks["myproject_frontend"] = "another-network"
+	assert.Check(t, r.hasNetworkMismatch(web, oc), "a different network must still be a mismatch")
+}
+
 // TestReconcileNetworks_Diverged asserts the Option-A recreation sequence for a
 // diverged network: attached containers are stopped and disconnected, the
 // network is removed then recreated, and the same containers are reconnected —
