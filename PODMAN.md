@@ -4,15 +4,15 @@ This fork makes `docker/compose` (the reference Compose implementation) run nati
 against Podman v4+, with a minimal, rebase-friendly overlay. This document is the
 agreed plan of record; the "Overlay index" section doubles as the rebase checklist.
 
-Status (2026-11-01): P0–P4 implemented — engine detection, socket defaulting
+Status (2026-11-05): P0–P6 implemented — engine detection, socket defaulting
 and probing with rootless hints, classic-build forcing, registry digest
 fallback, e2e `DOCKER_HOST` support, link emulation, secret ownership, the P1
 compat shims (port ranges, `json-file`, `dockerfile_inline`, secrets/configs),
 build-arg image identity, watch sync into existing paths, one-off/log-attach
 races, default-bridge link injection, log-driver fallback, the `compose ps`
 health suffix and a CI matrix that runs the e2e suite against Podman 4.3
-(Debian 12), 4.9 (Ubuntu 24.04) and current Fedora. Known Podman gaps are
-listed below.
+(Debian 12), 4.9 (Ubuntu 24.04) and current Fedora, in both rootless and
+rootful modes. Known Podman gaps are listed below.
 
 ## Goal
 
@@ -122,10 +122,10 @@ binary, `pkg/compose/build_bake.go:182`).
 | `cmd/main.go` | Call `compose.ConfigurePodmanHost()` before `plugin.Run`. That helper (`pkg/compose/podman.go`) defaults `DOCKER_HOST` to the rootless/rootful Podman socket when the profile is on and no `DOCKER_HOST`/`DOCKER_CONTEXT`/`-H`/`--host`/`--context` is set; explicit `podman` with no responding socket exits with rootless/rootful enable hints. |
 | `cmd/compose/run.go` | Materialize the implicit `default` network at project level when a job is turned into a runnable service: compose-go leaves it unresolved for a job-only project, and Podman <5 rejects the empty network name the create path would otherwise send. |
 | `pkg/compose/build_bake.go` | If Podman, return classic (`POST /build?version=1`, served by buildah). Podman has no `/grpc` or `/session`, so bake cannot work; without buildx upstream already falls back, this makes it deterministic. |
-| `pkg/compose/build_classic.go` | Materialize `build.dockerfile_inline` to a temp file for the classic builder (it otherwise requires a Dockerfile on disk), and fingerprint build args into an image label so buildah's cache cannot hide a changed arg behind an unchanged image ID. |
+| `pkg/compose/build_classic.go` | Materialize `build.dockerfile_inline` to a temp file for the classic builder (it otherwise requires a Dockerfile on disk), fingerprint build args into an image label so buildah's cache cannot hide a changed arg behind an unchanged image ID, and tag built images with the standard project/service/version labels (lost upstream when the internal BuildKit builder was removed) so `down --rmi` can find them. On Podman with a local or cloned context the standard labels are injected as deterministic Dockerfile instructions, because buildah randomizes the order of labels passed in the build request and would change the image ID on every rebuild; remote contexts keep the build-request labels since they have no local Dockerfile to rewrite. |
 | `pkg/compose/create.go` | Podman-only: expand published port ranges by replica index (`podmanHostPort`), map `json-file` to `k8s-file`, mount an anonymous volume at `/run/secrets` for secrets and configs targeting it (`podmanFileReferenceVolume`), skip structured secret/config mounts, skip legacy `links` and publish link aliases on the target's endpoints (`podmanLinkAliases`). |
 | `pkg/compose/reconcile.go` | Accept the network name Podman <5 reports in `NetworkID` as equivalent to the engine-assigned network ID, so an unchanged running container is not recreated on every `up`/scale. |
-| `pkg/compose/executor_ops.go` | Podman-only: inject secrets/configs at container creation, because an attach stream opened before the start phase makes Podman extract the archive into the root filesystem instead of the `/run/secrets` volume. The start phase repeats the copy harmlessly. |
+| `pkg/compose/executor_ops.go` | Podman-only: for an attached (interactive) up, inject secrets/configs at container creation, because an attach stream opened before the start phase makes Podman extract the archive into the root filesystem instead of the `/run/secrets` volume. Detached up, create and start inject right before the start, as Docker does, so `create` does not resolve environment secrets early. |
 | `pkg/compose/apiSocket.go` | On Podman, bind the engine's own API socket (from `DOCKER_HOST`) at `/var/run/docker.sock`, the path services expect. |
 | `pkg/compose/pull.go` | If Podman, resolve image digests via `registry.RemoteDigest` (`internal/registry/remote.go`) because Podman has no `GET /distribution/{name}/json`. |
 | `internal/relay/relay.go` | Probe whether the relay-link gateway is bindable by this host before announcing it: rootless engines (and rootful engines inside a container) may not own it, so the provider binds the wildcard instead. On Podman the relay dials `host.containers.internal`, which Podman provisions itself. |
@@ -135,8 +135,10 @@ binary, `pkg/compose/build_bake.go:182`).
 | `pkg/compose/up.go`, `pkg/compose/logs.go` | Treat a container removed between its start event and log attach as already finished instead of failing `up`/`logs --follow`. |
 | `internal/sync/tar.go` | Retry without implied directory headers when the engine reports `file exists` (Podman's copier), in addition to Docker's symlink error; when Podman 6 still reports `path escapes from parent`, resolve the target and copy there. |
 | `pkg/compose/watch.go` | `ResolvePath` runs `readlink -f` in the container so sync can write through a symlink Podman 6 refuses to traverse. |
+| `pkg/bridge/convert.go` | On a rootless engine (reported as `name=rootless` in `/info` SecurityOptions, or a per-user graph root on Podman 4.x), run the bridge transformer as container root: container root maps to the invoking user, so the transformer can read the 0600 input and write the output bind mounts. Rootful engines keep the historical host-uid setting. |
 | `pkg/e2e/framework.go` | Pass `DOCKER_HOST` through to e2e commands, like `DOCKER_CONTEXT`, and copy the host `config.json` into the per-test config dir (the upstream check was inverted, which breaks podman-docker's CLI wrapper). |
-| `.github/workflows/ci.yml` | Publish fork releases from `podman-v*` tags (non-draft) and skip upstream `v*` releases in the fork; its existing binary/SBOM/provenance/signing jobs build the assets. |
+| `pkg/e2e/compose_run_test.go` | Assert `run` port publication through `compose ps` rather than raw `docker ps`: Podman <1.44 omits the published port's host IP from the container summary, so the Docker CLI renders only the container port. |
+| `.github/workflows/ci.yml` | Publish fork releases from `v*` tags when dispatched with `release=true` (non-draft) and skip upstream `v*` tag pushes in the fork; its existing binary/SBOM/provenance/signing jobs build the assets. |
 
 All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`,
 `.github/*`), which never conflict on rebase.
@@ -161,25 +163,35 @@ All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`,
 
 ## Known Podman gaps (documented, not worked around)
 
-These are engine limitations, not missing compose features:
+These are engine limitations, not missing compose features (compose-side
+fallbacks are noted where they exist):
 
 - **Docker-only log drivers** (e.g. `fluentd`) — Podman supports
   `k8s-file`/`journald`/`none`/`passthrough`; `json-file` and any other
   unsupported driver fall back to `k8s-file` with a warning, so logs stay
   local instead of reaching the configured sink.
 - **BuildKit-only build features** (multi-arch, build secrets, ssh,
-  additional contexts, builder selection) — classic builder limitation;
-  upstream already prints a clear error. Podman builds with buildah.
-- **Build log and error text** — tests asserting Docker's classic
-  "naming to … done" output or `No such image: …` wording do not match
-  buildah's output, although the build succeeds.
+  additional contexts other than `service:` references in an inline
+  Dockerfile, builder selection) — classic builder limitation; upstream
+  already prints a clear error. Podman builds with buildah. Service references
+  are rewritten to the image the classic builder produces for that dependency.
+- **Build error text** — tests asserting Docker's classic `No such image: …`
+  wording do not match buildah's output, although the build succeeds. Classic
+  builds emit the `naming to … done` line Docker reports.
 - **Default-bridge links in shell-less images** — the aliases are appended to
   `/etc/hosts` with `sh` after start; scratch/distroless images keep the old
   no-DNS behavior. An app resolving names during its first instruction can
   still race the injection.
-- **Static network address metadata** — the address is assigned, but Podman
-  reports `IPAMConfig` as `null` in inspect; assert `IPAddress` instead.
-  (`TestIPAMConfig` still reads the metadata field.)
+- **Static network address metadata** — the address is assigned and Podman's
+  network inspect reports it (`.Containers[*].IPv4Address`, via
+  `convertLibpodNetworktoDockerNetwork`), but container inspect leaves the
+  endpoint's `IPAMConfig` `null`: `GET /containers/{id}/json` uses
+  `getContainerNetworkInfo` (`libpod/networking_common.go`), which never fills
+  the `InspectAdditionalNetwork.IPAMConfig` field. Even a plain
+  `docker run --ip` returns `null`, so this is not a compose-side gap.
+  `TestIPAMConfig` reads the container field, so it cannot pass until either
+  the test asserts `IPAddress` instead or Podman fills `IPAMConfig` from the
+  stored static IPs.
 - **Stale image identity on Podman 4.3** — after a rebuild, the tag can still
   resolve to the previous image ID, so compose keeps the old containers
   (`TestScaleDownNoRecreate`). Current Podman resolves it correctly, so the
@@ -190,56 +202,165 @@ These are engine limitations, not missing compose features:
   `State.Restarting` backoff to clients.
 - **Inspect network mode** — Podman reports `HostConfig.NetworkMode` as
   `bridge` for containers attached to an external network.
-- **Swarm features, `compose alpha` provider/relay/bridge, Docker Desktop** —
-  not applicable to Podman; `TestProvider*`, `TestDependsOnMultipleProviders`
-  and the bridge convert tests are excluded.
+- **Relay endpoint binding** — a rootless engine keeps its bridge networks in
+  a user namespace, and a rootful engine running inside a container may not own
+  the relay-link gateway either. Compose probes the gateway and announces none
+  when this host cannot bind it; the provider falls back to the wildcard and
+  the relay reaches it through `host.containers.internal` on Podman (Podman
+  provisions that itself) or `host.docker.internal` on Docker. Rootful engines
+  with a bindable gateway keep the gateway-bound path. Swarm, `compose alpha`
+  features that are Docker-only, and Docker Desktop remain out of scope.
 
-Environment-dependent failures (not Podman bugs, but the CI container has no
-systemd and local runs can be rootless):
+Environment-dependent failures (not Podman bugs, but a host without systemd
+leaves healthchecks starting, and local runs can be rootless):
 
-- **Healthchecks on Podman 4.3** — Podman 4.3 schedules them with systemd
-  timers; without systemd they never leave `starting` (`TestLocalComposeUp`).
-  Podman 5.8 runs them normally, and the status suffix is restored for both.
-- **Ping-based tests in rootless mode** — rootless containers lack
-  `CAP_NET_RAW` here (`TestWatchExec`, `TestUpStopWithLogsMixed`); they pass
-  with rootful Podman in CI.
+- **Healthchecks require systemd** — Podman schedules them with systemd
+  transient timers, so on a host without systemd they never leave `starting`.
+  The CI workflow boots systemd as PID 1 in the test container before running
+  the suite, and the rootless mode enables lingering so the non-root user gets
+  a systemd user manager for its transient timers. The local baseline below
+  was recorded on a systemd host. The `compose ps` health suffix is restored
+  for both 4.3 and 5.8.
+- **Docker CLI compatibility probes** — CI installs the real Docker CLI
+  (pinned to 27.5.1: Docker 29 raised the minimum API to 1.44, above Podman
+  4.3's 1.40) instead of `podman-docker`, exactly as a local run against the
+  Podman socket does. The wrapper's reduced commands and output types
+  (`docker info` `DriverStatus`, `docker context create --docker` TLS options,
+  the image-inspect `.ID` field, `docker top`) made the CLI-probe tests fail
+  only in CI. With the real client the containerd-store and umask probes skip
+  on Podman and `TestUpImageID` runs. `TestBuildTLS`, `TestLocalComposeUp` and
+  `TestLoggingDriver` stay on the denylist for engine-side reasons: the first
+  selects a Docker-in-Docker context while `DOCKER_HOST` still points at
+  Podman (so the profile forces the classic builder), the second reads the
+  compose `top` layout, and the third relies on the log-driver fallback.
+- **Rootless mode (`E2E_ROOTLESS=1`)** — the CI container runs the suite as a
+  non-root user whose uid matches the checkout, with subuid/subgid mappings
+  and a lingering systemd user manager (`loginctl enable-linger`). That
+  matches the rootless host baseline, so the commit/job-only/idempotent
+  up/scale/interactive-hook cases run instead of being skipped. The bridge
+  transformer also runs as container root in this mode (`pkg/bridge/convert.go`):
+  container root maps to the invoking user, so it can read the 0600 input bind
+  mount and write the output directory. Fedora 45's
+  `shadow-utils-subid` package ships `newuidmap`/`newgidmap` without setuid
+  or file capabilities, so the script grants them `cap_setuid,cap_setgid`
+  with `setcap` before starting rootless Podman. The outer container also
+  runs with AppArmor unconfined, but that only unconfines the container: on
+  Ubuntu 26.04 the host's `pasta` profile still attaches when the nested
+  engine execs `pasta` and rejects the SIGTERM that tears down the rootless
+  network namespace, so every `down` fails with `rootless netns: kill network
+  process: permission denied`. The harness adds the runner-image
+  `signal (receive) set=(term) peer=podman,` rule to
+  `/etc/apparmor.d/usr.bin.pasta` and reloads it when the profile is present
+  and still lacks the rule (actions/runner-images#15184). Ubuntu 24.04 ships
+  no pasta profile, and the rootful leg does not use the rootless netns.
+- **Rootful mode (`E2E_ROOTLESS=0`)** — the matrix also runs every Podman
+  version as root inside the test container, with the same denylist as
+  rootless for that version. The cases that previously failed rootful (empty
+  commit body, empty job network name, unnecessary recreate, timing and
+  inspect differences) are run in both modes, so a failure is a real engine
+  gap to fix rather than a reason to drop the rootful leg.
+- **Version gaps (Podman 4.3/4.9)** — `TestBuildEscaped` fails in both modes
+  on the older engines: their buildah predates Dockerfile heredocs, so the
+  `RUN <<'EOF'` body is parsed as instructions. The other recreate, job-only
+  network and port-display gaps are handled by the Podman profile:
+  `pkg/compose/reconcile.go` accepts the network name Podman <5 reports in
+  `NetworkID`, `cmd/compose/run.go` materializes the implicit default network
+  for a job-only project, and `TestComposeRunPorts` asserts through `compose
+  ps` instead of raw `docker ps` (Podman <1.44 omits the published port's host
+  IP from the container summary). Podman 4.3 additionally skips `TestCommit`,
+  `TestCommitWithReplicas`, `TestUpExitCodeFromContainerKilled` and
+  `TestUpProfile`: its inspect state briefly reports `stopped` before cleanup
+  settles on `exited`, and the profile scenario asserts the Docker state once.
+  The three interactive-hook tests and `TestConvertAndTransformList` run on
+  every version, as do the cases that previously failed only rootful.
 - **Fixed subnets** — tests hard-coding `192.168.0.0/16` collide with the host
   network of the test machine (`TestNetworkConfigChanged`).
-- **SELinux relabel mode** — `TestLocalComposeVolume` asserts the inspect
-  `Mode:"z"` field, which only exists with SELinux labelling enabled.
+- **Anonymous-volume inspect mode** — `TestLocalComposeVolume` asserts the
+  inspect `Mode:"z"` field Docker reports for an anonymous volume created
+  through the mount API; Podman reports it empty. This is engine metadata, not
+  a labelling requirement: Podman does report `z` when the mount asks for it.
 - **Logs-follow cold start** — `TestLocalComposeLogsFollow` gives the first
   stream 1s to produce a line; Podman can take longer on a loaded host. The
   follow itself, including replicas created later, works.
-- **Rootless host file permissions** — `TestLocalComposeLargeLogs` bind-mounts
-  a 0600 temp file the rootless container user cannot read.
+- **Watch rebuild timing** — `TestWatchMultiServices` can time out with service
+  `a` not running after a rebuild on a loaded host; the single-service watch
+  sync tests pass.
+- **SELinux-labelled bind mounts** — on an SELinux-enforcing host a direct run
+  cannot read the 0600 files the tests bind-mount from their 0700 temp dirs
+  (`TestComposeRun`, `TestLocalComposeLargeLogs`, `TestStdoutStderr`,
+  `TestProjectVolumeBind`) unless the mount is relabelled. The CI harness runs
+  with `--security-opt=label=disable`, so those tests run there. `bridge
+  convert` used to hit the same gap, but its transformer now runs as container
+  root in a rootless engine, which maps to the invoking user and can read the
+  0600 `compose.yaml` in the 0700 temp dir.
 
-### Full-suite baseline (Podman 5.8.9 rootless, 2026-11-01)
+### Full-suite baseline (Podman 5.8.9 rootless, 2026-11-05)
 
-`go test -tags e2e ./pkg/e2e` → **183 pass / 47 fail / 9 skip** at the time
-of this snapshot. The compose-side fixes now also make
-`TestScaleDownNoRecreate`, `TestWatchSyncIntoSymlinkedDirectory`,
-`TestCascadeIgnoresOneOffContainer` and `TestExposeRange` pass. Every remaining
-failure falls into the categories above:
+Whole suite, serial, with `TMPDIR` under `/tmp/opencode`, after `make build`
+and `make example-provider`:
 
-- BuildKit/buildx/build-log: `TestBuild*`, `TestComposeRunBuild`,
-  `TestRunBuildOnce{Dependency,NestedDependencies,NoDeps}`.
-- Alpha provider/relay/bridge: `TestProvider*`,
-  `TestDependsOnMultipleProviders`, `TestBridgeConvertOutputNotEmptyConfirmed`,
-  `TestConvertAndTransformList`, `TestConvertBuildOnlyService`.
-- Engine behavior: `TestIPAMConfig`, `TestLocalComposeLogsFollow`,
-  `TestNetworkLinks`, `TestNoDepsNetworkMode`,
+`go test -tags e2e ./pkg/e2e -parallel 1 -timeout 40m` → **221 pass / 30 fail /
+10 skip** (261 top-level tests). The rootless relay fix landed after this run:
+the two relay endpoint cases now pass too, so the current result is **223 pass /
+28 fail / 10 skip**. With the provider fixture built, all ten provider cases
+pass. The skips are optional Docker Desktop, model/buildx, containerd-store and
+multi-platform cases. `TestLocalComposeUp` passes with the `compose ps` health suffix. The
+`use_api_socket` and interactive hook cases pass after the fixes above.
+`TestAttachRestart`, `TestNestedDotEnv`, `TestLocalComposeLogsFollow` and
+`TestWatchMultiServices` passed in this run but remain timing-sensitive: the
+restart/log-attach race, a Podman attach after the container exited, a loaded
+host's cold start, and watch rebuild timing. Every failure in this run falls
+into the categories above:
+
+- BuildKit/buildx/build-log: `TestBuildAdditionalContextDisabledService`,
+  `TestBuildBuilder`, `TestBuildDependentImage`,
+  `TestBuildDependentImageWithProfile`, `TestBuildEntitlements`,
+  `TestBuildImageDependencies`, `TestBuildPlatformsStandardErrors`,
+  `TestBuildPlatformsWithCorrectBuildxConfig`, `TestBuildPrivileged`,
+  `TestBuildSecrets`, `TestBuildSSH`, `TestBuildSubDependencies`,
+  `TestComposeRunBuild` and `TestRunBuildOnce{Dependency,NestedDependencies,NoDeps}`.
+- Bridge convert (rootless only; fixed after this baseline):
+  `TestBridgeConvertOutputNotEmptyConfirmed`, `TestConvertAndTransformList`,
+  `TestConvertBuildOnlyService`. The transformer now runs as container root in
+  a rootless engine, so it can read the 0600 input bind mount; the CI container
+  disables SELinux, so the relabel gap does not apply there. On a
+  SELinux-enforcing host these still need a relabel or `label=disable`.
+- Engine/watch behavior: `TestIPAMConfig`, `TestNoDepsNetworkMode`,
   `TestUpAttachedTerminatesOnExternalStop`,
-  `TestRebuildOnDotEnvWithExternalNetwork`, `TestAttachRestart`,
-  `TestLoggingDriver`.
-- Environment/flaky on this host: `TestLocalComposeUp` (no systemd),
-  `TestUpStopWithLogsMixed`/`TestWatchExec` (rootless ping),
-  `TestWatchMultiServices` (watch timing), `TestNetworkConfigChanged`
-  (host subnet), `TestLocalComposeVolume` (SELinux mode field),
-  `TestLocalComposeLargeLogs` (rootless file permissions).
+  `TestRebuildOnDotEnvWithExternalNetwork`.
+- SELinux on this host (direct run; these pass under the CI harness):
+  `TestComposeRun`, `TestLocalComposeLargeLogs`, `TestStdoutStderr`,
+  `TestProjectVolumeBind`.
+- Anonymous-volume inspect mode: `TestLocalComposeVolume`.
 
-The CI script runs the passing Podman-relevant subset; expanding it to the
-whole suite requires either fixing the engine gaps above or marking these as
-skips with the reasons recorded here.
+The six build cases unskipped after this run pass on 5.8.9:
+`TestBuildAdditionalContextDisabledService`, `TestBuildDependentImage`,
+`TestBuildSubDependencies` and the three `TestRunBuildOnce*` cases.
+`TestComposeRunBuild` builds, but its one-off attach still hangs intermittently,
+so it stays on the denylist.
+
+The two cases added by the v5.7 sync also run on Podman:
+`TestFileReferenceOverridesWarning` passes because only an interactive up
+injects file references at creation, so `create` leaves the missing
+environment secret for the start; `TestDownImagesOfSelectedServices` passes
+on 4.9/current because classic-built images carry the project/service labels,
+so `down --rmi local` finds the selected service's image. On Podman the same
+labels are written into the Dockerfile, so they survive the build cache (see
+the build-classic overlay entry above).
+
+The CI script runs the whole suite serially (`-test.parallel 1`, because a few
+tests share and remove the same image tags) with a `-test.skip` denylist. The
+matrix runs every Podman version in both modes, and both modes use the same
+denylist for that version. The common denylist is 22 tests: the baseline
+failures that remain (the three bridge-convert cases, the two relay endpoint
+cases and the SELinux bind-mount cases now run), the CLI/engine probes, the
+anonymous-volume inspect case and the host-only flakes. Podman 4.3/4.9 add
+`TestBuildEscaped` (23 total); Podman 4.3 adds five more (28). The 10 runtime
+skips are separate and still happen.
+Both e2e workflows build `example-provider` before starting the container, so
+the provider cases are exercised. Fixing an engine gap or removing an
+environment restriction means removing the test from that list and its note
+here.
 
 ## Known hazards (tracked, with mitigations)
 
@@ -278,27 +399,40 @@ skips with the reasons recorded here.
   - `.github/workflows/sync-upstream.yml` automates the rebase recipe above.
     Daily it checks whether the latest upstream release tag is already in
     `podman`; on a new tag it rebases `podman` onto that tag, runs the unit
-    suite and the e2e matrix below, then force-pushes `podman`, tags
-    `podman-vX.Y.Z`, and dispatches `ci.yml` at that tag. `ci.yml` reuses its
+    suite and the e2e matrix below, verifies the overlay commit layout, then
+    force-pushes `podman` and tags its `ci(podman):` tip `vX.Y.Z` with an
+    annotated tag; there is no release-marker commit. `ci.yml` reuses its
     existing binary and finalize jobs to build the cross-platform binaries,
     named as on docker/compose (`docker-compose-linux-x86_64`, ...), with SBOM
     (`.sbom.json`), SLSA provenance (`.provenance.json`), signature
     (`.sigstore.json`), `.sha256` and a `checksums.txt`, then publishes the
-    release. The release branch is exactly the upstream release with the
-    overlay on top: the workflow adds no bookkeeping commits and fetches only
-    the tag, never upstream's branches. A failed rebase or test regression
-    leaves `podman` and the releases untouched and files an issue instead. The
-    upstream `v*` tag release path in `ci.yml` stays a draft and is skipped in
-    the fork. Set the repo to allow GitHub Actions to create and dispatch
-    releases.
-  - `.github/workflows/podman-e2e.yml` runs the e2e smoke suite against the
-    Podman matrix. The static test binary executes inside a privileged
-    container (`debian:12`, `ubuntu:24.04`, `fedora:latest`), so old Podman
-    versions need no host compatibility. The Fedora leg uses vfs storage and
-    a tmpfs for `/var/tmp`: Fedora 45's buildah rejects an overlay over a
-    build context on the container's overlay root. Optional
+    release, with a Podman note and the upstream release changelog. The
+    workflow fetches the upstream tag into `refs/upstream-tags/`, so it never
+    touches the fork's release tags or upstream branches, and folds `fixup!`
+    commits into their layer during the rebase. A failed rebase or test
+    regression leaves `podman` and the releases untouched and files an issue
+    instead. Its e2e job builds the provider fixture and runs
+    `podman-e2e-container.sh`, the same systemd-in-container harness as the
+    manual workflow, so the release gate cannot drift from the suite that was
+    validated. The upstream `v*` tag release path in `ci.yml` stays a draft and
+    is skipped in the fork. Set the repo to allow GitHub Actions to create and
+    dispatch releases.
+  - `.github/workflows/podman-e2e.yml` runs the e2e smoke suite on manual
+    dispatch against the Podman matrix. The static test binary executes inside
+    a privileged container (`debian:12`, `ubuntu:24.04`, `fedora:latest`), so
+    old Podman versions need no host compatibility. The Fedora leg uses vfs
+    storage and a tmpfs for `/var/tmp`: Fedora 45's buildah rejects an overlay
+    over a build context on the container's overlay root. Optional
     `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` secrets raise Docker Hub pull
-    limits.
+    limits. Docker is only the outer runtime: it boots systemd and provides
+    the bind mount. Each matrix version runs twice: rootless
+    (`E2E_ROOTLESS=1`) as a non-root user with subuid/subgid mappings and a
+    lingering user systemd manager, matching the local baseline, and rootful
+    (`E2E_ROOTLESS=0`) as root. Both legs use the same denylist for that
+    version, including the 15 cases that previously failed rootful; only the
+    Podman 4.3/4.9 version gaps are skipped in both modes. Switching the outer
+    runtime to Podman would not change the inner engine: the user and the
+    engine's rootless mode are the parts that matter.
 
 ## Testing
 
@@ -306,24 +440,54 @@ skips with the reasons recorded here.
   env/host-based, so `pkg/compose/podman_test.go` needs no API mocks (socket
   tests use a local unix listener), and the build path keeps its existing
   stubs untouched.
-- **E2E against Podman**: the CI script
+- **E2E against Podman**: the workflow builds `bin/build/example-provider`
+  (`make example-provider`) before compiling the static test binary, so the
+  provider cases have their fixture. The CI script
   `.github/scripts/podman-e2e.sh` builds a static test binary and runs the
-  validated subset (up/ps/copy/exec/logs/start/stop/events/networks/wait/
-  pull/port-range/secrets/links, plus watch sync, cascades (including a
-  concurrent one-off), expose ranges, hooks, restart and network modes) and a
-  classic-build smoke on every Podman version. Known gaps above are excluded
-  by design. The log-driver fallback is exercised on a host with a real Docker
-  CLI: `TestLoggingDriver` probes `docker info -f {{.OperatingSystem}}`, which
-  podman-docker's wrapper does not implement.
-- **Local runs** use the same script:
-  `CGO_ENABLED=0 make build GO_BUILDTAGS="e2e standalone" && CGO_ENABLED=0 go
-  test -c -tags "e2e standalone" -o bin/e2e.test ./pkg/e2e` then
-  `docker run --rm --privileged -v "$PWD:$PWD" -w "$PWD"
-  -e E2E_BIN="$PWD/bin/build/docker-compose" debian:12
-  bash "$PWD/.github/scripts/podman-e2e.sh"`. Notes:
+  whole suite except the gaps documented above, using a `-test.skip` denylist
+  (every test not named there runs), plus a classic-build smoke on every
+  Podman version. The workflow boots systemd as PID 1 in the privileged test
+  container (with a healthcheck smoke check before the suite), because Podman
+  schedules healthchecks through systemd timers. The matrix runs each version
+  in both modes: with `E2E_ROOTLESS=1` the suite runs as a non-root user whose
+  uid matches the checkout, with subuid/subgid mappings and
+  `loginctl enable-linger` for the user manager; rootless storage tries the
+  matrix driver and falls back to vfs. With `E2E_ROOTLESS=0` it runs as root
+  with the same denylist for that version, so the 15 previously rootful-only
+  cases run on current Fedora and the Podman 4.3/4.9 version gaps are skipped
+  in both modes. The denylist mirrors the "Known Podman gaps",
+  "Environment-dependent failures" and full-suite baseline sections here:
+  BuildKit/build-log cases, engine and watch differences, the anonymous-volume
+  inspect case and the host-only flakes. The script installs the real Docker CLI (not
+  `podman-docker`) so the suite drives Podman's socket the same way a local run
+  does; the containerd-store and umask probes then skip instead of failing.
+- **Local runs** use the same scripts:
+  `CGO_ENABLED=0 make build GO_BUILDTAGS="e2e standalone" && CGO_ENABLED=0 make
+  example-provider && CGO_ENABLED=0 go test -c -tags "e2e standalone" -o
+  bin/e2e.test ./pkg/e2e` then
+  `IMAGE=debian:12 STORAGE_DRIVER=overlay E2E_ROOTLESS=1
+  E2E_BIN="$PWD/bin/build/docker-compose" PODMAN_E2E_ALLOW_LOCAL=1
+  bash "$PWD/.github/scripts/podman-e2e-container.sh"`.
+  `podman-e2e-container.sh` starts the matrix image with systemd as PID 1 and
+  runs `podman-e2e.sh` inside it via `docker exec`. Because it is privileged
+  and uses `--cgroupns=host` with a writable `/sys/fs/cgroup`, its systemd can
+  take over the host console; run it only in a disposable VM. The script
+  refuses to start outside CI unless `PODMAN_E2E_ALLOW_LOCAL=1` is set. Notes:
+  - set `E2E_ROOTLESS=0` to run the rootful leg locally; it uses the same
+    suite and denylist as the rootless leg for that Podman version, so current
+    Podman runs the 15 previously rootful-only cases and old versions skip the
+    version gaps in both modes;
+  - the provider cases need `bin/build/example-provider`; `make
+    example-provider` puts it next to the compose binary the tests resolve,
+    and `make e2e-compose` / `make e2e-compose-standalone` build it too;
   - the e2e harness copies `$HOME/.docker/config.json` only when it is missing
     (upstream quirk) — the script provides a minimal `{}` file;
-  - nested podman uses `vfs` storage in the script for reliability.
+  - rootless mode tries the matrix storage driver (overlay with
+    `fuse-overlayfs`) and falls back to vfs when nested overlay is unsupported;
+  - the bridge transformer runs as container root in rootless mode, so it can
+    read the 0600 input and write the output bind mounts. On a
+    SELinux-enforcing host a local run still needs a relabel or
+    `--security-opt label=disable`; the CI container disables SELinux.
 - `golangci-lint run --build-tags "e2e" ./...` after every change (AGENTS.md).
 
 ## Work plan
@@ -349,6 +513,13 @@ skips with the reasons recorded here.
   container status so `compose ps` matches Docker and `TestLocalComposeUp`
   passes on Podman 5.8. On 4.3 the suffix is restored too, but the healthcheck
   itself still needs systemd (see known gaps).
+- **P6 (implemented)** — run the e2e suite in both rootless and rootful modes
+  in CI, with the same denylist for each Podman version. Rootless matches the
+  host baseline, and rootful runs the same commit/job-only/idempotent-up/scale/
+  interactive-hook cases so a failure is a real engine gap to fix. Podman
+  4.3/4.9 version gaps are skipped in both modes, not by mode. The bridge
+  transformer runs as container root on rootless engines so it can read the
+  0600 input bind mount.
 
 ## Overlay commit layout
 
