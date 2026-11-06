@@ -1093,16 +1093,17 @@ func serviceHashWithResolvedRefs(service types.ServiceConfig, containers map[str
 // hasNetworkMismatch checks if the container is not connected to all expected networks.
 func (r *reconciler) hasNetworkMismatch(expected types.ServiceConfig, oc ObservedContainer) bool {
 	for _, net := range slices.Sorted(maps.Keys(expected.Networks)) {
-		expectedID := ""
-		if obs, ok := r.resolvedNetworks[net]; ok {
-			expectedID = obs.ID
-		}
-		if expectedID == "" || expectedID == "swarm" {
+		obs, ok := r.resolvedNetworks[net]
+		if !ok || obs.ID == "" || obs.ID == "swarm" {
 			continue
 		}
 		found := false
 		for _, netID := range oc.ConnectedNetworks {
-			if netID == expectedID {
+			// Podman <5 reports the network name in NetworkID (both in the
+			// container summary and in this map). Accept it alongside the
+			// real ID so an unchanged container is not recreated on every
+			// up/scale; the ID still catches a genuinely recreated network.
+			if netID == obs.ID || (obs.Name != "" && netID == obs.Name) {
 				found = true
 				break
 			}
