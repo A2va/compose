@@ -130,6 +130,28 @@ func TestMaterializeManualJob(t *testing.T) {
 		assert.Equal(t, svc.Image, "backup-tool")
 	})
 
+	t.Run("a job-only project materializes the implicit default network", func(t *testing.T) {
+		p := &types.Project{
+			Name: "myProject",
+			Jobs: types.Jobs{
+				"migrate": {
+					Name:     "migrate",
+					Triggers: &types.TriggerConfig{Manual: &yes},
+					ContainerSpec: types.ContainerSpec{
+						Image:    "migrator",
+						Networks: map[string]*types.ServiceNetworkConfig{"default": nil},
+					},
+				},
+			},
+		}
+
+		got, err := materializeManualJob(p, "migrate")
+		assert.NilError(t, err)
+		network, ok := got.Networks["default"]
+		assert.Check(t, ok, "the materialized job's default network must exist at project level")
+		assert.Equal(t, network.Name, "myProject_default")
+	})
+
 	t.Run("manual: false explicitly forbids manual execution", func(t *testing.T) {
 		_, err := materializeManualJob(base(), "rotation")
 		assert.Error(t, err, `job "rotation" is declared with manual: false, it cannot be run manually`)

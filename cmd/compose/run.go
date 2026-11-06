@@ -479,6 +479,9 @@ func materializeManualJob(project *types.Project, name string) (*types.Project, 
 	if err != nil {
 		return nil, err
 	}
+	if project.Services == nil {
+		project.Services = types.Services{}
+	}
 	// A job may depend on other jobs: materialize the whole job closure so
 	// every depends_on reference resolves to a service — the dependency job
 	// runs through the exact machinery a service dependency does (a
@@ -489,7 +492,35 @@ func materializeManualJob(project *types.Project, name string) (*types.Project, 
 		return nil, err
 	}
 	project.Services[name] = jobAsService(project, name, job)
+	materializeImplicitDefaultNetwork(project)
 	return project, nil
+}
+
+// materializeImplicitDefaultNetwork restores the project-level default network
+// a service would get from the loader. compose-go normalizes it for services,
+// but a job-only project has no top-level network, leaving the materialized
+// job's `default` reference unresolved: the create path then asks the engine
+// to connect the container to the empty network name. Docker accepts that as
+// its default bridge, but Podman <5 rejects it with "invalid network name or
+// ID: value is empty".
+func materializeImplicitDefaultNetwork(project *types.Project) {
+	usesDefault := false
+	for _, svc := range project.Services {
+		if _, ok := svc.Networks["default"]; ok {
+			usesDefault = true
+			break
+		}
+	}
+	if !usesDefault {
+		return
+	}
+	if network, ok := project.Networks["default"]; ok && network.Name != "" {
+		return
+	}
+	if project.Networks == nil {
+		project.Networks = types.Networks{}
+	}
+	project.Networks["default"] = types.NetworkConfig{Name: project.Name + "_default"}
 }
 
 // materializeJobClosure adds every job reachable through job-typed
