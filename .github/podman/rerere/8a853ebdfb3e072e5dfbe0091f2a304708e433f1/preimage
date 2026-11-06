@@ -1,0 +1,239 @@
+# Podman support — implementation plan
+
+This fork makes `docker/compose` (the reference Compose implementation) run natively
+against Podman v4+, with a minimal, rebase-friendly overlay. This document is the
+agreed plan of record; the "Overlay index" section doubles as the rebase checklist.
+
+<<<<<<<
+Status (2026-11-01): P0 and P1 implemented — engine detection, socket defaulting,
+classic-build forcing, registry digest fallback, e2e `DOCKER_HOST` support and the
+P1 compat shims (port ranges, `json-file`, `dockerfile_inline`, secrets/configs).
+Known Podman gaps are listed below; P2 (Debian 12 matrix) remains.
+=======
+Status (2026-11-01): P0, P1 and P2 implemented — engine detection, socket
+defaulting, classic-build forcing, registry digest fallback, e2e `DOCKER_HOST`
+support, link emulation, secret ownership, the P1 compat shims (port ranges,
+`json-file`, `dockerfile_inline`, secrets/configs) and a CI matrix that runs the
+e2e smoke suite against Podman 4.3 (Debian 12), 4.9 (Ubuntu 24.04) and current
+Fedora. Known Podman gaps are listed below.
+>>>>>>>
+
+## Goal
+
+- Full Compose-spec behavior on Podman v4 (incl. Debian 12's 4.3), v5, and v6.
+- Smallest possible diff vs upstream; long-term maintainability wins over minimal
+  changes when they conflict.
+- Docker support is *not required* to be preserved, but it is preserved for free
+  (all changes are behind Podman detection) — this is what keeps rebases trivial.
+
+## Recommendation
+
+**Do not write a Podman-native backend. Run compose against Podman's
+Docker-compatible API (`podman system service`) and add a thin "Podman engine
+profile": socket auto-selection, build strategy, and a small set of compat
+shims.**
+
+Rationale:
+
+1. Compose v5 talks to the engine exclusively through docker/cli's
+   `command.Cli` + the moby `client.APIClient` (`pkg/compose/compose.go:280`)
+   and negotiates the API version at ping. The pinned client
+   (`moby/moby/client v0.6.2`) speaks **1.40–1.56** — exactly covering what
+   Podman reports on every target version (see matrix below).
+2. Podman's compat service is a first-class, documented way to run compose
+   (`podman-system-service(1)` literally shows `DOCKER_HOST=...podman.sock` +
+   `docker-compose up`). It has worked in the field since Podman 4.x.
+3. Compose is already defensive: every >1.44 engine feature is gated on the
+   *negotiated* version with working fallbacks (multi-endpoint create →
+   post-create `NetworkConnect`, manifests query params, …). On Podman the
+   negotiation lands at 1.40/1.41/1.44 and the fallbacks engage automatically.
+4. `podman-compose` (Python) re-implements the spec and lags by design;
+   even the Podman community's de-facto answer is "use docker-compose against
+   the podman socket". A fork of compose gives Podman users the *reference*
+   implementation — the full spec, at upstream speed.
+
+## Compat matrix (verified)
+
+| Podman | Reports Docker API | Status in this fork |
+|---|---|---|
+| 4.3.x (Debian 12) | 1.40 | supported (client floor is exactly 1.40) — see hazard H2 |
+| 4.4–4.9 | 1.40/1.41 | supported |
+| 5.0–5.7 | 1.41 | supported |
+| 5.8+ / 6.x | 1.44 | supported (best parity) |
+
+Validated live against Podman 5.8.9 (Fedora 44).
+
+## Alternatives considered (rejected)
+
+1. **Native libpod REST backend implementing `client.APIClient`** — ~100+
+   endpoints to reimplement/track; every upstream feature lands as a conflict.
+   Rebase death. (The `DryRunClient` decorator in `pkg/dryrun/` proves the seam
+   is swappable — we just don't need to pay for it.)
+2. **Contribute Podman support upstream** — docker/cli and moby client are
+   Docker-internal; upstream won't carry Podman-specific shims.
+3. **Keep using `podman-compose`** — separate codebase, spec lag (e.g. no
+   `cp`), maintenance is intermittent; doesn't meet "full spec" requirement.
+4. **Compat socket + thin profile (chosen)** — engine does the compat work;
+   the fork only smooths the deltas listed below.
+
+## Architecture: where the overlay hooks in
+
+The engine seam is `command.Cli` → `client.APIClient`; compose never talks to
+the engine any other way (bake is the one exception: it `exec`s the buildx
+binary, `pkg/compose/build_bake.go:182`).
+
+**Detection** — `pkg/compose/podman.go`:
+- `COMPOSE_CONTAINER_ENGINE=podman|docker` env var (explicit override), else
+- a binary named `podman-compose` (this fork's packaging) defaults to the
+  Podman socket, while `docker-compose`/plugin invocations keep Docker's
+  default and never get hijacked;
+- `isPodman()`, used by the shims, additionally treats any `DOCKER_HOST`
+  containing `podman` as Podman. `podman compose` exports exactly that, so
+  wrapper-driven runs are detected too. Detection stays API-free on purpose:
+  an `/info` probe would force every build-path unit test to stub one more
+  call.
+
+**Overlay index — upstream files touched (the rebase checklist):**
+
+| File | Change |
+|---|---|
+| `cmd/main.go` | Call `compose.ConfigurePodmanHost()` before `plugin.Run`. That helper (`pkg/compose/podman.go`) defaults `DOCKER_HOST` to the rootless/rootful Podman socket when the profile is on and no `DOCKER_HOST`/`DOCKER_CONTEXT`/`-H`/`--host`/`--context` is set; explicit `podman` with no socket exits with an actionable message. |
+| `pkg/compose/build_bake.go` | If Podman, return classic (`POST /build?version=1`, served by buildah). Podman has no `/grpc` or `/session`, so bake cannot work; without buildx upstream already falls back, this makes it deterministic. |
+| `pkg/compose/build_classic.go` | Materialize `build.dockerfile_inline` to a temp file for the classic builder (it otherwise requires a Dockerfile on disk). |
+<<<<<<<
+| `pkg/compose/create.go` | Podman-only: expand published port ranges by replica index (`podmanHostPort`), map `json-file` to `k8s-file`, append secret/config binds from `podmanFileReferenceBinds`, skip structured secret/config mounts. |
+| `pkg/compose/pull.go` | If Podman, resolve image digests via `registryRemoteDigest` (`pkg/compose/podman_registry.go`) because Podman has no `GET /distribution/{name}/json`. |
+| `pkg/compose/secrets.go` | Tar entries use relative names (Podman silently drops absolute ones) and Podman skips post-create injection (files are bind-mounted instead). |
+=======
+| `pkg/compose/create.go` | Podman-only: expand published port ranges by replica index (`podmanHostPort`), map `json-file` to `k8s-file`, mount an anonymous volume at `/run/secrets` for secrets (`podmanSecretVolume`), skip structured secret/config mounts, skip legacy `links` and publish link aliases on the target's endpoints (`podmanLinkAliases`). |
+| `pkg/compose/pull.go` | If Podman, resolve image digests via `registryRemoteDigest` (`pkg/compose/podman_registry.go`) because Podman has no `GET /distribution/{name}/json`. |
+| `pkg/compose/secrets.go` | Tar entries use relative names and include parent directories, and Podman skips `copyUIDGID` so the declared uid/gid/mode survive extraction. |
+| `pkg/compose/ps.go` | Podman <1.44 omits EXPOSE'd ports from `/containers/json` and the host IP from published ports; restore both for `compose ps`/`port`. |
+>>>>>>>
+| `pkg/e2e/framework.go` | Pass `DOCKER_HOST` through to e2e commands, like `DOCKER_CONTEXT`. |
+
+All other logic lives in new files (`pkg/compose/podman*.go`, `PODMAN.md`,
+`.github/workflows/sync-upstream.yml`), which never conflict on rebase.
+
+**Podman-only helpers (new files):**
+- `podman.go` — profile detection, socket selection, `isPodman()`.
+- `podman_registry.go` — minimal registry client (Bearer challenge, OCI/Docker
+  manifest `Accept` headers, body hashing) used by digest resolution. No new
+  dependencies.
+<<<<<<<
+- `podman_secrets.go` — anonymous volume at `/run/secrets` so archive injection
+  reaches Podman's tmpfs-backed secrets directory.
+- `podman_links.go` — emulates legacy `links` as network aliases on the link
+  target (Podman rejects `HostConfig.Links`). The alias is resolvable by every
+  container on the shared network, a superset of Docker's per-source entry.
+=======
+- `podman_secrets.go` — secret/config bind strings with `:z` (SELinux), content
+  materialized under `$TMPDIR/compose-podman/<project>/` so user files are
+  never relabeled.
+>>>>>>>
+
+## Known Podman gaps (documented, not worked around)
+
+These are engine limitations, not missing compose features:
+
+<<<<<<<
+=======
+- **`links:`** — Podman removed container links; its compat API rejects
+  `HostConfig.Links`. Use service DNS / `networks: aliases` instead.
+  (`TestNetworkAliases` is expected to fail against Podman.)
+- **Secret `uid`/`gid`/`mode`** — content is correct, but rootless host bind
+  mounts cannot assume arbitrary container uids/gids. Compose already warns
+  that these are Swarm-only; Docker happens to apply them via its archive API.
+>>>>>>>
+- **Docker-only log drivers** (e.g. `fluentd`) — Podman supports
+  `k8s-file`/`journald`/`none`/`passthrough`; `json-file` is mapped to
+  `k8s-file`. `TestLoggingDriver` (fluentd) is expected to fail.
+- **BuildKit-only build features** (multi-arch, build secrets, ssh,
+  additional contexts) — classic builder limitation; upstream already prints a
+  clear error. Podman builds with buildah.
+- **Swarm features, `compose alpha` provider/relay, Docker Desktop** — not
+  applicable to Podman.
+
+## Known hazards (tracked, with mitigations)
+
+- **H1 — upstream bumps the moby client floor.** Docker CLI 29-era clients
+  already reject servers < 1.44 (containers/podman#27890); our pinned
+  `moby/moby/client v0.6.2` floor is verified at 1.40. On rebase, if
+  `MinAPIVersion` rises above Podman's reported version, pin the previous
+  client module in `go.mod` (or carry a one-line patch) and note it here.
+- **H2 — Podman 4.3 build endpoint rejects some classic-builder query params**
+<<<<<<<
+  (containers/podman#15928, fixed in 4.4). The CI build smoke runs on the
+  Debian 12 leg and passes, so the parameter set sent by the pinned client is
+  accepted. Keep an eye on it when bumping the moby client.
+- **H3 — resolved:** Podman mounts a tmpfs at `/run/secrets` (so plain writes
+  to a stopped container are shadowed) and treats `copyUIDGID=true` as "chown
+  to the daemon user". Secrets now go through an anonymous volume and the
+  tar-declared ownership, so uid/gid/mode match Docker.
+=======
+  (containers/podman#15928, fixed in 4.4). Verify on Debian 12 first; if it
+  bites, sanitize the `/build` query (drop empty `cachefrom`, `ulimits=null`,
+  etc.) in a small `client.APIClient` decorator following the `DryRunClient`
+  pattern — no upstream-file changes needed.
+- **H3 — resolved:** `PUT /archive` on a created container silently does
+  nothing on Podman; secrets/configs now use `:z` bind mounts instead.
+>>>>>>>
+- **H4 — resolved:** events/log filters behave; validated with the e2e suite.
+
+## Fork & rebase strategy
+
+- Branch model: `main` tracks upstream `docker/compose` tags; `podman` (or
+  `podman/main`) is our release branch, rebased onto each upstream tag.
+  `upstream` remote, never merge — rebase keeps our hunks visible.
+- **All Podman logic lives in new `podman*.go` files**; upstream files get
+  only the small guarded hunks in the overlay index above.
+- Rebase recipe: `git fetch upstream && git rebase upstream/vX.Y` → expect
+  conflicts only in the files listed above → `make build test` + e2e vs Podman
+  → update this doc → done.
+- No renames, no reformats, no drive-by fixes in upstream files (per
+  CONTRIBUTING.md) — every extra touched line is a future conflict.
+- Binary/deployment: the standalone binary (`plugin.RunningStandalone()` in
+  `cmd/main.go`) already accepts compose-style args, so
+  `containers.conf(5)` `compose_providers = ["/usr/local/bin/podman-compose"]`
+  wires `podman compose ...` straight to it. No wrapper code needed.
+- CI: `.github/workflows/sync-upstream.yml` automates the rebase recipe above.
+  Daily it compares upstream's latest release with `.github/upstream-release`;
+  on a new tag it rebases, builds, unit-tests, uploads the binary artifact and
+  opens a PR — or files a rebase-conflict issue when the overlay needs a
+  manual fix. Set the repo to allow GitHub Actions to create pull requests.
+
+## Testing
+
+- **Unit**: existing gomock pattern (`pkg/mocks/`, `make mocks`); detection
+  is env/host-based so `pkg/compose/podman_test.go` needs no API mocks, and
+  the build path keeps its existing stubs untouched.
+- **E2E against Podman**:
+  `HOME=<dir-with-.docker/config.json> DOCKER_HOST=unix:///run/podman/podman.sock
+  go test -tags e2e ./pkg/e2e -run '<tests>'`. Notes:
+  - the harness copies `$HOME/.docker/config.json` only when it is missing
+    (upstream quirk) — provide a minimal `{}` file;
+  - if `podman system service` cannot reach journald (e.g. CI sandbox), start
+    it with a `containers.conf` setting `log_driver = "k8s-file"`.
+- Validated against Podman 5.8.9: up/ps/copy/exec/logs/start/stop/events/
+  networks/wait/healthcheck/pull/port-range/build/secrets-from-include pass.
+  Expected failures are the documented gaps above.
+- `golangci-lint run --build-tags "e2e" ./...` after every change (AGENTS.md).
+
+## Work plan
+
+- **P0 (implemented)** — detection + socket defaulting + classic-build forcing.
+- **P1 (implemented)** — registry digest fallback, e2e `DOCKER_HOST` support,
+<<<<<<<
+  port ranges, `json-file`, `dockerfile_inline`, secret ownership
+  (uid/gid/mode), `ps` port display, `links` via network aliases; e2e smoke
+  matrix green except the documented engine gaps.
+- **P2 (implemented)** — CI matrix for Podman 4.3 (Debian 12), 4.9 (Ubuntu
+  24.04) and current Fedora, with a classic-build smoke on each version.
+=======
+  port ranges, `json-file`, `dockerfile_inline`, secret/config `:z` binds;
+  e2e smoke matrix green except the documented engine gaps.
+- **P2** — Debian 12 / Podman 4.3 validation job (H2); CI for the matrix.
+>>>>>>>
+- **P3** (optional) — Podman niceties: rootless hints in errors, socket
+  auto-activation check, `podman build` shell-out for multi-arch if ever
+  needed.

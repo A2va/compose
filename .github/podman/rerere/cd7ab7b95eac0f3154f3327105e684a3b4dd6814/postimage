@@ -1,0 +1,86 @@
+/*
+   Copyright 2020 Docker Compose CLI authors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package compose
+
+import (
+	"context"
+	"strings"
+
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+
+	"github.com/docker/compose/v5/internal/concurrency"
+	"github.com/docker/compose/v5/internal/progress"
+	"github.com/docker/compose/v5/pkg/api"
+)
+
+func (s *composeService) Pause(ctx context.Context, projectName string, options api.PauseOptions) error {
+	return Run(ctx, func(ctx context.Context) error {
+		return s.pause(ctx, strings.ToLower(projectName), options)
+	}, "pause", s.events)
+}
+
+func (s *composeService) pause(ctx context.Context, projectName string, options api.PauseOptions) error {
+	return s.forEachPausable(ctx, projectName, options, "Paused", func(ctx context.Context, ctr container.Summary) error {
+		_, err := s.apiClient().ContainerPause(ctx, ctr.ID, client.ContainerPauseOptions{})
+		return err
+	})
+}
+
+func isPausable(ctr container.Summary) bool {
+	return ctr.State == container.StateRunning || ctr.State == container.StatePaused
+}
+
+func (s *composeService) UnPause(ctx context.Context, projectName string, options api.PauseOptions) error {
+	return Run(ctx, func(ctx context.Context) error {
+		return s.unPause(ctx, strings.ToLower(projectName), options)
+	}, "unpause", s.events)
+}
+
+func (s *composeService) unPause(ctx context.Context, projectName string, options api.PauseOptions) error {
+	return s.forEachPausable(ctx, projectName, options, "Unpaused", func(ctx context.Context, ctr container.Summary) error {
+		_, err := s.apiClient().ContainerUnpause(ctx, ctr.ID, client.ContainerUnpauseOptions{})
+		return err
+	})
+}
+
+// forEachPausable runs fn concurrently on the containers pause and unpause act on:
+// those of the selected services, one-off containers excluded. Each container fn
+// succeeded on is reported as done with the given status.
+func (s *composeService) forEachPausable(ctx context.Context, projectName string, options api.PauseOptions, status string, fn func(context.Context, container.Summary) error) error {
+	// Podman hides paused containers from the default list, so it must list all
+	// and let the engine reject an already-paused container.
+	containers, err := s.getContainers(ctx, projectName, oneOffExclude, isPodman(), options.Services...)
+	if err != nil {
+		return err
+	}
+	if isPodman() {
+		containers = containers.filter(isPausable)
+	}
+
+	if options.Project != nil {
+		containers = containers.filter(isService(options.Project.ServiceNames()...))
+	}
+
+	return concurrency.ForEachBounded(ctx, s.maxConcurrency, containers, func(ctx context.Context, ctr container.Summary) error {
+		err := fn(ctx, ctr)
+		if err == nil {
+			s.events.On(progress.New(getContainerProgressName(ctr), api.Done, status))
+		}
+		return err
+	})
+}
