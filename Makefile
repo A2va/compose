@@ -86,7 +86,7 @@ e2e-compose: example-provider ## Run end to end local tests in plugin mode. Set 
 	$(GOTESTSUM) --format testname --junitfile "/tmp/report/report.xml" -- -v $(TEST_FLAGS) -count=1 -parallel=$(E2E_PARALLEL_PLUGIN) -timeout 20m -tags e2e ./pkg/e2e
 
 .PHONY: e2e-compose-standalone
-e2e-compose-standalone: ## Run End to end local tests in standalone mode. Set E2E_TEST=TestName to run a single test
+e2e-compose-standalone: example-provider ## Run End to end local tests in standalone mode. Set E2E_TEST=TestName to run a single test
 	$(GOTESTSUM) --format testname --junitfile "/tmp/report/report.xml" -- $(TEST_FLAGS) -v -count=1 -parallel=$(E2E_STANDALONE_PARALLEL) -timeout 20m --tags=e2e,standalone ./pkg/e2e
 
 .PHONY: build-and-e2e-compose
