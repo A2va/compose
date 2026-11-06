@@ -20,6 +20,11 @@ on:
         description: 'To run with tmate enter "debug_enabled"'
         required: false
         default: "false"
+      release:
+        description: 'Publish the release for this tag'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   validate:
@@ -388,7 +393,9 @@ jobs:
           echo "$NEEDS" | jq -e 'to_entries | all(.[]; .value.result == "success" or ((.key | IN("bin-image-test", "relay-image-test")) and .value.result == "skipped"))' > /dev/null
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Fork releases are dispatched by sync-upstream with release=true at the
+    # vX.Y.Z tag; upstream v* tag pushes keep the draft-for-review flow.
+    if: startsWith(github.ref, 'refs/tags/v') && (!github.event.repository.fork || (github.event_name == 'workflow_dispatch' && inputs.release))
     permissions:
       contents: write # to create a release (softprops/action-gh-release)
     runs-on: ubuntu-latest
@@ -415,12 +422,32 @@ jobs:
         run: |
           find bin/release -type f -exec file -e ascii -- {} +
       -
+        name: Prepare release notes
+        if: github.event.repository.fork
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          upstream=$(gh api "repos/docker/compose/releases/tags/${TAG_NAME}" --jq .body 2>/dev/null || true)
+          {
+            echo "Podman overlay release for [docker/compose ${TAG_NAME}](https://github.com/docker/compose/releases/tag/${TAG_NAME})."
+            echo
+            echo "See [PODMAN.md](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG_NAME}/PODMAN.md) for the supported Podman matrix and known engine gaps."
+            if [ -n "${upstream}" ]; then
+              echo
+              echo "## Upstream changelog"
+              echo
+              echo "${upstream}"
+            fi
+          } > release-notes.md
+      -
         name: GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: ./bin/release/*
-          generate_release_notes: true
-          draft: true
+          body_path: ${{ github.event.repository.fork && 'release-notes.md' || '' }}
+          generate_release_notes: ${{ !github.event.repository.fork }}
+          draft: ${{ !github.event.repository.fork }}
           # never replace assets already uploaded to an existing release
           # (softprops updates an existing release for the tag instead of failing)
           overwrite_files: false
