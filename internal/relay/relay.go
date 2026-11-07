@@ -36,6 +36,7 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 
+	"github.com/docker/compose/v5/internal/engine"
 	"github.com/docker/compose/v5/internal/naming"
 	"github.com/docker/compose/v5/internal/progress"
 	"github.com/docker/compose/v5/pkg/api"
@@ -94,10 +95,10 @@ func relayRoutesSpec(endpoints map[int]string) string {
 // point. Providers express endpoints from the host's perspective — a loopback
 // or unspecified address names the machine compose runs on — but the relay
 // dials from its own network namespace, where those addresses name the relay
-// container itself. host.docker.internal resolves natively on Docker Desktop
-// and is provisioned through ExtraHosts (host-gateway) on plain Linux
-// engines. Anything else (a LAN IP, a DNS name) is reachable as-is from the
-// relay and passes verbatim.
+// container itself. Docker Desktop resolves host.docker.internal natively and
+// plain Docker provisions it through ExtraHosts (host-gateway); Podman adds
+// host.containers.internal itself. Anything else (a LAN IP, a DNS name) is
+// reachable as-is from the relay and passes verbatim.
 func relayUpstream(endpoint string) string {
 	host, port, err := net.SplitHostPort(endpoint)
 	if err != nil {
@@ -111,7 +112,14 @@ func relayUpstream(endpoint string) string {
 	if !hostRelative {
 		return endpoint
 	}
-	return net.JoinHostPort("host.docker.internal", port)
+	return net.JoinHostPort(relayHostName(), port)
+}
+
+func relayHostName() string {
+	if engine.IsPodman() {
+		return "host.containers.internal"
+	}
+	return "host.docker.internal"
 }
 
 func relayIdentity(routes string) string {
@@ -210,8 +218,27 @@ func (s *Service) Info(ctx context.Context, project *types.Project, service type
 		// provider's next get-relay-info retries the whole thing
 		return answer
 	}
+	if gateway != "" && !hostCanBind(gateway) {
+		// The gateway is not a local address of this host: rootless engines
+		// keep the bridge in a user namespace, and a rootful engine running
+		// inside a container may not own it either. A provider that bound it
+		// would fail, so announce no gateway and let it bind the wildcard.
+		logrus.Debugf("relay link gateway %s is not bindable on this host; asking the provider to bind elsewhere", gateway)
+		return answer
+	}
 	answer.Networks = append(answer.Networks, NetworkInfo{Name: name, Gateway: gateway})
 	return answer
+}
+
+// hostCanBind reports whether this host can listen on addr, the same check the
+// provider's endpoint does before publishing it.
+func hostCanBind(addr string) bool {
+	listener, err := net.Listen("tcp", net.JoinHostPort(addr, "0"))
+	if err != nil {
+		return false
+	}
+	_ = listener.Close()
+	return true
 }
 
 // relayLinkNetworkName is the deterministic name of the dedicated network

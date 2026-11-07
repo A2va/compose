@@ -29,6 +29,7 @@ import (
 	"go.uber.org/mock/gomock"
 	"gotest.tools/v3/assert"
 
+	"github.com/docker/compose/v5/internal/engine"
 	"github.com/docker/compose/v5/internal/naming"
 	"github.com/docker/compose/v5/internal/progress"
 	"github.com/docker/compose/v5/pkg/api"
@@ -55,6 +56,28 @@ func (conflictError) Conflict()     {}
 func newTestRelay(mockCtrl *gomock.Controller) (*mocks.MockAPIClient, *Service) {
 	apiMock := mocks.NewMockAPIClient(mockCtrl)
 	return apiMock, New(testBackend{apiMock})
+}
+
+// A gateway this host cannot bind (rootless user namespace, or a rootful
+// engine inside a container) is not announced; the provider binds the
+// wildcard and the relay dials the host alias instead.
+func TestInfoSkipsUnbindableGateway(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	apiMock, svc := newTestRelay(mockCtrl)
+
+	project := &types.Project{Name: "p"}
+	service := types.ServiceConfig{Name: "db", Provider: &types.ServiceProviderConfig{Type: "test"}}
+
+	apiMock.EXPECT().NetworkList(gomock.Any(), gomock.Any()).Return(client.NetworkListResult{
+		Items: []network.Summary{{Network: network.Network{ID: "net-1", Name: "p_db_relay"}}},
+	}, nil)
+	inspect := client.NetworkInspectResult{}
+	inspect.Network.IPAM.Config = []network.IPAMConfig{{Gateway: netip.MustParseAddr("192.0.2.1")}}
+	apiMock.EXPECT().NetworkInspect(gomock.Any(), "p_db_relay", gomock.Any()).Return(inspect, nil)
+
+	answer := svc.Info(t.Context(), project, service)
+	assert.Equal(t, len(answer.Networks), 0)
 }
 
 // COMPOSE_RELAY_IMAGE lets internal-registry users substitute their own copy
@@ -106,6 +129,18 @@ func TestRelayUpstream(t *testing.T) {
 	} {
 		assert.Equal(t, relayUpstream(endpoint), want, "endpoint %q", endpoint)
 	}
+}
+
+// Podman resolves host.containers.internal itself; host.docker.internal is
+// only provisioned by Docker's host-gateway extra host.
+func TestRelayUpstreamOnPodmanUsesContainersInternal(t *testing.T) {
+	previous := engine.IsPodman()
+	engine.SetPodmanProfile(true)
+	t.Cleanup(func() { engine.SetPodmanProfile(previous) })
+
+	assert.Equal(t, relayUpstream("localhost:5734"), "host.containers.internal:5734")
+	assert.Equal(t, relayUpstream("127.0.0.1:5734"), "host.containers.internal:5734")
+	assert.Equal(t, relayUpstream("192.168.1.10:5734"), "192.168.1.10:5734")
 }
 
 // The rewrite happens inside relayRoutesSpec, so the relay identity hashes
