@@ -159,7 +159,7 @@ func TestHelperProviderConfigImage(t *testing.T) {
 // (this test binary re-executed, see TestHelperProviderRelayInfo): the
 // get-relay-info message must be answered with one JSON line naming the
 // service's dedicated relay-link network — created on demand — with its
-// engine-assigned gateway. Never one of the project's own declared
+// gateway when this host can bind it. Never one of the project's own declared
 // networks (proj_backend here): those are joined by the dependent too, so
 // announcing one of them would give the provider an address every sibling
 // on it can also reach.
@@ -177,7 +177,8 @@ func TestExecutePlugin_GetRelayInfo(t *testing.T) {
 	inspect := client.NetworkInspectResult{}
 	inspect.Network.Name = "proj_db_relay"
 	inspect.Network.IPAM.Config = []network.IPAMConfig{
-		{Gateway: netip.MustParseAddr("172.18.0.1")},
+		// an address this host can bind, so get-relay-info announces it
+		{Gateway: netip.MustParseAddr("127.0.0.1")},
 	}
 	apiClient.EXPECT().NetworkInspect(gomock.Any(), "proj_db_relay", gomock.Any()).
 		Return(inspect, nil)
@@ -205,7 +206,7 @@ func TestExecutePlugin_GetRelayInfo(t *testing.T) {
 	variables, err := svc.executePlugin(t.Context(), project, cmd, "up", service)
 	assert.NilError(t, err)
 	assert.Equal(t, variables.prefixed["RELAY_NETWORK"], "proj_db_relay")
-	assert.Equal(t, variables.prefixed["RELAY_GATEWAY"], "172.18.0.1")
+	assert.Equal(t, variables.prefixed["RELAY_GATEWAY"], "127.0.0.1")
 }
 
 // TestHelperProviderRelayInfo is not a test: it is the fake provider process
