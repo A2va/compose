@@ -47,7 +47,7 @@ const (
 // container rejects the hooks with a conflict: they have no process to run in,
 // so they are skipped and the caller still stops or restarts the container.
 func (s *composeService) runPreStopHooks(ctx context.Context, ctr container.Summary, service *types.ServiceConfig, listener api.ContainerEventListener) (gone bool, err error) {
-	if service == nil || isRelayContainer(ctr) {
+	if service == nil || isRelayContainer(ctr) || podmanSkipsPreStopHooks(ctr) {
 		return false, nil
 	}
 	for _, hook := range service.PreStop {
