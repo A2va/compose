@@ -17,7 +17,12 @@
 package compose
 
 import (
+	"context"
+	"fmt"
+	"time"
+
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 )
 
 // podmanSkipsPreStopHooks reports whether ctr cannot run a pre_stop hook.
@@ -26,4 +31,33 @@ import (
 // and still stop or restart the container.
 func podmanSkipsPreStopHooks(ctr container.Summary) bool {
 	return isPodman() && ctr.State != container.StateRunning
+}
+
+// podmanWaitPreStart polls the hook runner until it stops and returns its exit
+// code. Podman 4.x rootful can miss the exit event of a short-lived container,
+// leaving ContainerWait pending until the caller's deadline; state polling has
+// no such race.
+func (s *composeService) podmanWaitPreStart(ctx context.Context, serviceName string, index int, containerID string) error {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		res, err := s.apiClient().ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+		if err != nil {
+			return err
+		}
+		state := res.Container.State
+		if state == nil {
+			return fmt.Errorf("service %q pre_start[%d]: hook container %s has no state", serviceName, index, containerID)
+		}
+		// Podman 4.3 can report a finished container as "stopped" before it
+		// settles on "exited".
+		if state.Status == container.StateExited || state.Status == container.StateDead || string(state.Status) == "stopped" {
+			return preStartResultErr(serviceName, index, container.WaitResponse{StatusCode: int64(state.ExitCode)})
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }

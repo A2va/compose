@@ -196,6 +196,8 @@ func (s *composeService) execPreStartHook(
 	// Subscribe to wait before start to avoid missing the exit event for short-lived hooks.
 	// WaitConditionNotRunning would match immediately because the container is still in
 	// "created" state, so use WaitConditionNextExit to block until the run actually finishes.
+	// Podman polls the state instead: its wait API can miss the exit of a
+	// short-lived hook even when subscribed after the start (see podmanWaitPreStart).
 	//
 	// The wait gets its own context: when the start fails, the container is
 	// removed and the daemon may never answer the pending wait (Podman keeps
@@ -204,9 +206,12 @@ func (s *composeService) execPreStartHook(
 	// error instead of hanging on a wait for a container that never ran.
 	waitCtx, cancelWait := context.WithCancel(ctx)
 	defer cancelWait()
-	waitRes := s.apiClient().ContainerWait(waitCtx, containerID, client.ContainerWaitOptions{
-		Condition: container.WaitConditionNextExit,
-	})
+	var waitRes client.ContainerWaitResult
+	if !isPodman() {
+		waitRes = s.apiClient().ContainerWait(waitCtx, containerID, client.ContainerWaitOptions{
+			Condition: container.WaitConditionNextExit,
+		})
+	}
 
 	if _, err := s.apiClient().ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
 		// AutoRemove is false, so we must remove the never-started container
@@ -215,18 +220,30 @@ func (s *composeService) execPreStartHook(
 			logrus.Warnf("service %q pre_start[%d]: failed to remove orphan hook container %s: %v", service.Name, index, containerID, removeErr)
 		}
 		// Drain waitRes so the client's wait goroutine exits without having to
-		// wait for the parent context to be canceled.
-		cancelWait()
-		select {
-		case <-waitRes.Error: //nolint:errcheck // only draining: the error that matters is the one being returned
-		case <-waitRes.Result:
-		case <-ctx.Done():
-		case <-time.After(s.drainTimeout()):
+		// wait for the parent context to be canceled. Podman has no wait stream
+		// yet: it subscribes only once the hook has started.
+		if !isPodman() {
+			cancelWait()
+			select {
+			case <-waitRes.Error: //nolint:errcheck // only draining: the error that matters is the one being returned
+			case <-waitRes.Result:
+			case <-ctx.Done():
+			case <-time.After(s.drainTimeout()):
+			}
 		}
 		// The daemon's error (a missing executable, a bad mount…) names neither
 		// the hook nor its image, and surfaces on the row of the service
 		// container: say which hook it is.
 		return fmt.Errorf("service %q pre_start[%d]%s: failed to start the hook container: %w", service.Name, index, hookImageSuffix(service, index), err)
+	}
+
+	var waitErr error
+	if isPodman() {
+		// Wait before opening the follow stream: Podman 4.x rootful can leave
+		// the container API serialized behind an open log stream, so inspecting
+		// while it is open would block. The runner is retained after exit, so
+		// its buffered logs are still available once the wait returns.
+		waitErr = s.podmanWaitPreStart(ctx, service.Name, index, containerID)
 	}
 
 	// Open the log stream once the hook is started: on a container still in
@@ -240,7 +257,9 @@ func (s *composeService) execPreStartHook(
 	defer cancelLogs()
 	logsDone, getTail := s.streamPreStartLogs(logCtx, containerID, service, index, listener)
 
-	waitErr := waitPreStart(ctx, service.Name, index, waitRes)
+	if !isPodman() {
+		waitErr = waitPreStart(ctx, service.Name, index, waitRes)
+	}
 	if ctx.Err() == nil {
 		// The daemon ends the follow stream itself once the hook has exited,
 		// after sending what it buffered: cancelling right away would cut that

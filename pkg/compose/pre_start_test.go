@@ -45,6 +45,9 @@ func newPreStartTestService(t *testing.T) (*composeService, *mocks.MockAPIClient
 
 func newPreStartTestServiceWithVersion(t *testing.T, apiVersion string) (*composeService, *mocks.MockAPIClient) {
 	t.Helper()
+	// These tests pin the Docker wait path; a developer's Podman DOCKER_HOST
+	// must not flip the service into the Podman branch.
+	t.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
 	ignoreExisting := goleak.IgnoreCurrent()
 	t.Cleanup(func() {
 		goleak.VerifyNone(t, ignoreExisting)

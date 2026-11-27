@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	"go.uber.org/mock/gomock"
 	"gotest.tools/v3/assert"
 )
 
@@ -34,4 +36,20 @@ func TestPodmanSkipsPreStopHooksOutsideRunningState(t *testing.T) {
 
 	t.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
 	assert.Check(t, !podmanSkipsPreStopHooks(container.Summary{State: container.StateExited}))
+}
+
+func TestPodmanWaitPreStartPollsUntilTheHookExits(t *testing.T) {
+	tested, apiClient := newPreStartTestService(t)
+	running := client.ContainerInspectResult{Container: container.InspectResponse{
+		State: &container.State{Status: container.StateRunning, Running: true},
+	}}
+	exited := client.ContainerInspectResult{Container: container.InspectResponse{
+		State: &container.State{Status: container.StateExited, ExitCode: 17},
+	}}
+	gomock.InOrder(
+		apiClient.EXPECT().ContainerInspect(gomock.Any(), "hook-1", gomock.Any()).Return(running, nil),
+		apiClient.EXPECT().ContainerInspect(gomock.Any(), "hook-1", gomock.Any()).Return(exited, nil),
+	)
+	err := tested.podmanWaitPreStart(t.Context(), "web", 0, "hook-1")
+	assert.ErrorContains(t, err, "exited with code 17")
 }
